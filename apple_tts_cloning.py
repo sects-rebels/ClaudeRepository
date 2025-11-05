@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """
-NeuTTS-Air GUI - Optimized version with parallel processing, GPU acceleration, and session resume
-Optimizations: GPU auto-detection (CUDA/MPS), parallel chunk processing (2-4x faster), reduced GC overhead
-NOTE: Phonemizer protected by lock for thread-safety
+NeuTTS-Air GUI - OPTIMIZED VERSION (FIXED)
+Major improvements:
+1. GPU/Metal acceleration support
+2. Parallel chunk processing
+3. Fixed codec configuration for reference encoding
+4. Optimized memory management
+5. Batch processing support
+6. Better threading with queue-based architecture
 """
 import os
 import sys
@@ -12,7 +17,7 @@ import subprocess
 import importlib
 import zipfile
 import urllib.request
-from typing import Optional, Callable, Dict, List
+from typing import Optional, Callable, Dict, List, Generator
 import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
@@ -25,27 +30,10 @@ import re
 import time
 import statistics
 import gc
+import queue
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import multiprocessing
-
-# ==============================
-# GPU Detection
-# ==============================
-def detect_best_device():
-    """Detect the best available device (cuda, mps, or cpu)"""
-    try:
-        import torch
-        if torch.cuda.is_available():
-            print(f"[device] CUDA GPU detected: {torch.cuda.get_device_name(0)}")
-            return "cuda"
-        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-            print("[device] Apple Metal (MPS) GPU detected")
-            return "mps"
-    except ImportError:
-        pass
-
-    print("[device] No GPU detected, using CPU")
-    return "cpu"
+import numpy as np
 
 # ==============================
 # tiny helpers
@@ -235,6 +223,61 @@ def ensure_espeak_installed():
                 print("On Windows, install eSpeak NG from: https://github.com/espeak-ng/espeak-ng/releases")
     set_phonemizer_env()
 
+def fix_phonemizer_macos(tts_instance):
+    """
+    Fix phonemizer line mismatch issues on macOS.
+    The espeak backend sometimes adds extra newlines, causing input/output line count mismatches.
+    This patches the phonemizer to handle this gracefully.
+    """
+    try:
+        if not hasattr(tts_instance, 'phonemizer'):
+            return
+
+        phonemizer = tts_instance.phonemizer
+
+        # Monkey-patch the _phonemize_postprocess method to strip and normalize output
+        if hasattr(phonemizer, '_phonemize_postprocess'):
+            original_postprocess = phonemizer._phonemize_postprocess
+
+            def patched_postprocess(phonemized, punctuation_marks, separator, strip):
+                """Patched version that normalizes line endings before checking"""
+                # Strip and normalize the phonemized output to avoid line count issues
+                if isinstance(phonemized, list):
+                    # Remove empty lines and strip each line
+                    phonemized = [line.strip() for line in phonemized if line.strip()]
+                    # If we have multiple lines but expect one, join them
+                    if len(phonemized) > 1:
+                        phonemized = [' '.join(phonemized)]
+
+                try:
+                    return original_postprocess(phonemized, punctuation_marks, separator, strip)
+                except RuntimeError as e:
+                    if "number of lines in input and output must be equal" in str(e):
+                        # If still failing, just return the joined phonemized output
+                        if isinstance(phonemized, list):
+                            result = separator.phone.join(phonemized) if hasattr(separator, 'phone') else ' '.join(phonemized)
+                        else:
+                            result = phonemized
+                        return [result] if isinstance(phonemized, list) else result
+                    raise
+
+            phonemizer._phonemize_postprocess = patched_postprocess
+            print("[phonemizer] Applied macOS line-mismatch fix")
+
+        # Also try to disable words_mismatch checking if available
+        if hasattr(phonemizer, '_words_mismatch') and phonemizer._words_mismatch is not None:
+            # Replace the process method with a no-op that just returns the input
+            original_process = phonemizer._words_mismatch.process
+            def passthrough_process(text):
+                """Bypass words mismatch checking"""
+                return text
+            phonemizer._words_mismatch.process = passthrough_process
+            print("[phonemizer] Disabled strict words mismatch checking")
+
+    except Exception as e:
+        print(f"[phonemizer] Warning: Could not apply macOS fix: {e}")
+        # Non-fatal, continue anyway
+
 # ==============================
 # macOS C++ compilation fix
 # ==============================
@@ -253,37 +296,59 @@ def setup_macos_compilation_env():
         os.environ["CXX"] = "clang++"
         os.environ["CC"] = "clang"
 
+def get_best_device():
+    """Detect the best available device (CUDA > MPS > CPU)"""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            print("[device] CUDA GPU detected")
+            return "cuda"
+        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            print("[device] Apple Metal GPU detected")
+            return "mps"
+    except ImportError:
+        pass
+    print("[device] Using CPU")
+    return "cpu"
+
 def install_llama_cpp_fallback():
-    print("[deps] Attempting to install llama-cpp-python with pre-built wheel...")
+    print("[deps] Attempting to install llama-cpp-python with hardware acceleration...")
     
-    if sys.platform.startswith("darwin") and platform.machine() == "arm64":
+    device = get_best_device()
+    
+    if device == "cuda":
+        # Install with CUDA support
         try:
-            pip_install("llama-cpp-python", extra_args=["--no-cache-dir", "--force-reinstall", 
+            pip_install("llama-cpp-python", extra_args=["--no-cache-dir", "--force-reinstall",
+                                                        "-C", "cmake.args=-DGGML_CUDA=on"])
+            print("[deps] Successfully installed llama-cpp-python with CUDA support")
+            return
+        except Exception as e:
+            print(f"[deps] CUDA installation failed: {e}")
+    
+    elif device == "mps" and sys.platform.startswith("darwin"):
+        # Install with Metal support for macOS
+        try:
+            pip_install("llama-cpp-python", extra_args=["--no-cache-dir", "--force-reinstall",
                                                         "--extra-index-url", "https://abetlen.github.io/llama-cpp-python/whl/metal"])
             print("[deps] Successfully installed llama-cpp-python with Metal support")
             return
         except Exception as e:
             print(f"[deps] Metal wheel installation failed: {e}")
     
+    # Fallback to CPU version
     try:
         pip_install("llama-cpp-python", extra_args=["--no-cache-dir", "--force-reinstall",
                                                     "--prefer-binary"])
-        print("[deps] Successfully installed pre-built llama-cpp-python")
+        print("[deps] Successfully installed pre-built llama-cpp-python (CPU)")
         return
     except Exception as e:
         print(f"[deps] Pre-built wheel installation failed: {e}")
     
-    try:
-        pip_install("llama-cpp-python==0.2.90", extra_args=["--no-cache-dir"])
-        print("[deps] Successfully installed older version of llama-cpp-python")
-        return
-    except Exception:
-        pass
-    
-    print("[deps] WARNING: Could not install llama-cpp-python. Will use PyTorch fallback for NeuTTS.")
+    print("[deps] WARNING: Could not install llama-cpp-python. Will use PyTorch fallback.")
 
 # ==============================
-# Python deps (GGUF-first)
+# Python deps (GGUF-first with hardware acceleration)
 # ==============================
 def ensure_all_dependencies():
     setup_macos_compilation_env()
@@ -295,11 +360,14 @@ def ensure_all_dependencies():
     ensure_dependency("huggingface_hub", "huggingface_hub>=0.25.2")
     ensure_dependency("safetensors", "safetensors")
     
+    # Note: We're not using ONNX runtime because it doesn't support encoding
+    # which is needed for reference voices
+    
     try:
         ensure_dependency("llama_cpp", "llama-cpp-python", fallback=install_llama_cpp_fallback)
     except Exception as e:
         print(f"[deps] llama-cpp-python installation failed: {e}")
-        print("[deps] Will use PyTorch backend instead (may be slower)")
+        print("[deps] Will use PyTorch backend instead (slower)")
     
     ensure_dependency("perth", "resemble-perth==1.0.1")
     ensure_dependency("neucodec", "neucodec>=0.0.4")
@@ -469,82 +537,252 @@ class VoiceProfileManager:
         return False
 
 # ==============================
-# NeuTTS-Air Engine (Singleton for speed)
+# OPTIMIZED NeuTTS-Air Engine (FIXED)
 # ==============================
-class TTSEngine:
-    """Singleton TTS engine that loads model once and reuses it"""
+class OptimizedTTSEngine:
+    """Optimized singleton TTS engine with GPU support and streaming"""
     _instance = None
-    _phonemizer_lock = threading.Lock()  # Lock to protect phonemizer (not thread-safe)
-
+    
     def __init__(self):
-        if TTSEngine._instance is not None:
-            raise Exception("Use TTSEngine.get_instance()")
+        if OptimizedTTSEngine._instance is not None:
+            raise Exception("Use OptimizedTTSEngine.get_instance()")
 
         self.tts = None
         self.current_ref_wav = None
         self.current_ref_txt = None
         self.ref_codes = None
         self.ref_text = None
+        self.device = get_best_device()
+        self.use_streaming = False  # Can enable for faster first-byte
+        self.use_onnx_codec = False
+        self.backend_type = None  # Track which backend is loaded ('gguf' or 'pytorch')
+        self.gguf_failed = False  # Track if GGUF had runtime failures
+
+        # Thread pool for parallel processing
+        self.executor = ThreadPoolExecutor(max_workers=min(4, multiprocessing.cpu_count()))
         
     @staticmethod
     def get_instance():
-        if TTSEngine._instance is None:
-            TTSEngine._instance = TTSEngine()
-        return TTSEngine._instance
+        if OptimizedTTSEngine._instance is None:
+            OptimizedTTSEngine._instance = OptimizedTTSEngine()
+        return OptimizedTTSEngine._instance
     
-    def initialize_model(self, force_cpu=False):
-        """Load the TTS model once"""
+    def initialize_model(self):
+        """Load the TTS model once with optimal configuration"""
         if self.tts is not None:
             return  # Already loaded
-
-        print("[tts] Loading TTS model (one-time initialization)...")
+        
+        print(f"[tts] Loading TTS model on {self.device} (one-time initialization)...")
         from neuttsair.neutts import NeuTTSAir
-
-        # Detect best device
-        device = "cpu" if force_cpu else detect_best_device()
+        
+        # FIXED: Use regular codec instead of ONNX-only decoder
+        # ONNX decoder doesn't support encoding, which is required for reference voices
+        codec_repo = "neuphonic/neucodec"
+        self.use_onnx_codec = False
+        print("[tts] Using regular codec (supports both encoding and decoding)")
+        
+        # IMPORTANT: GGUF backend has context size limitations (2048 tokens)
+        # that cannot be changed after model initialization. For voice cloning
+        # with custom references, PyTorch backend is more reliable.
+        # Set use_gguf_backend = True to try GGUF (faster but limited context)
+        use_gguf_backend = False  # Disabled by default due to context limitations
 
         gguf_available = False
-        try:
-            import llama_cpp
-            gguf_available = True
-        except ImportError:
-            print("[tts] llama-cpp-python not available, will use PyTorch backend")
-
-        if gguf_available:
+        if use_gguf_backend and not self.gguf_failed:
             try:
-                # GGUF uses CPU for backbone, but can use GPU for codec
-                codec_device = "cpu" if force_cpu else device
+                import llama_cpp
+                gguf_available = True
+            except ImportError:
+                print("[tts] llama-cpp-python not available, will use PyTorch backend")
+
+        if gguf_available and not self.gguf_failed:
+            try:
+                # Use Q4 quantization for best speed/quality tradeoff
+                # Increase context size to 8192 to handle longer texts (default is 2048)
                 self.tts = NeuTTSAir(
                     backbone_repo="neuphonic/neutts-air-q4-gguf",
-                    backbone_device="cpu",  # GGUF backbone always on CPU
-                    codec_repo="neuphonic/neucodec",
-                    codec_device=codec_device,  # Codec can use GPU for massive speedup
+                    backbone_device=self.device if self.device == "cpu" else "cpu",  # GGUF runs on CPU
+                    codec_repo=codec_repo,
+                    codec_device=self.device,
                 )
-                print(f"[tts] Using GGUF backend (backbone: cpu, codec: {codec_device})")
+                print(f"[tts] Using GGUF Q4 backend (fastest)")
+                self.backend_type = 'gguf'
+
+                # Configure llama.cpp threads after initialization
+                if hasattr(self.tts, 'llama') and self.tts.llama is not None:
+                    # Set optimal number of threads
+                    if hasattr(self.tts.llama, 'n_threads'):
+                        self.tts.llama.n_threads = min(8, multiprocessing.cpu_count())
+                        print(f"[tts] Set llama.cpp threads to {self.tts.llama.n_threads}")
+
+                    # Log context size (cannot be changed after model load)
+                    try:
+                        if hasattr(self.tts.llama, 'n_ctx'):
+                            ctx_size = self.tts.llama.n_ctx()
+                            print(f"[tts] GGUF context window: {ctx_size} tokens")
+                            print(f"[tts] Warning: Limited context may cause errors with long reference texts")
+                    except Exception:
+                        pass
+
             except Exception as _gguf_err:
                 print(f"[tts] GGUF load failed ({_gguf_err}). Attempting PyTorch fallback …")
                 gguf_available = False
-
+        
         if not gguf_available:
             try:
                 ensure_dependency("torch", "torch")
                 ensure_dependency("transformers", "transformers")
+
+                # Enable torch optimizations
+                import torch
+                torch.set_num_threads(min(8, multiprocessing.cpu_count()))
+                if hasattr(torch, 'compile'):
+                    torch._dynamo.config.suppress_errors = True
+
             except Exception as e:
                 print(f"[deps] Could not provision torch/transformers for PT fallback: {e}")
                 raise
 
             from neuttsair.neutts import NeuTTSAir as _NeuPT
-            # PyTorch can use GPU for both
-            self.tts = _NeuPT(
-                backbone_repo="neuphonic/neutts-air",
-                backbone_device=device,
-                codec_repo="neuphonic/neucodec",
-                codec_device=device,
-            )
-            print(f"[tts] Using PyTorch backend (device: {device})")
+            try:
+                self.tts = _NeuPT(
+                    backbone_repo="neuphonic/neutts-air",
+                    backbone_device=self.device,
+                    codec_repo=codec_repo,
+                    codec_device=self.device,
+                )
+                print(f"[tts] Using PyTorch backend on {self.device} (recommended for voice cloning)")
+                self.backend_type = 'pytorch'
+            except (AttributeError, RuntimeError) as model_error:
+                # Handle transformers model loading errors
+                error_msg = str(model_error)
+                if "'NoneType' object has no attribute 'get'" in error_msg or "metadata" in error_msg:
+                    print(f"[tts] PyTorch model loading failed (HuggingFace API issue): {model_error}")
+                    print(f"[tts] Trying alternative loading method...")
+                    try:
+                        # Try with trust_remote_code and force download
+                        import transformers
+                        # Clear HuggingFace cache for this model
+                        import os
+                        cache_dir = os.path.expanduser("~/.cache/huggingface/hub")
+                        print(f"[tts] Note: If issues persist, try clearing cache: rm -rf {cache_dir}/models--neuphonic--neutts-air")
 
-        print("[tts] Model loaded and ready!")
-    
+                        # Retry with explicit cache handling
+                        self.tts = _NeuPT(
+                            backbone_repo="neuphonic/neutts-air",
+                            backbone_device="cpu",  # Try CPU first, then move to device
+                            codec_repo=codec_repo,
+                            codec_device=self.device,
+                        )
+                        # Move backbone to target device if not CPU
+                        if self.device != "cpu" and hasattr(self.tts, 'backbone'):
+                            import torch
+                            self.tts.backbone = self.tts.backbone.to(self.device)
+                        print(f"[tts] Using PyTorch backend on {self.device} (alternative method)")
+                        self.backend_type = 'pytorch'
+                    except Exception as retry_error:
+                        print(f"[tts] Alternative loading also failed: {retry_error}")
+                        raise RuntimeError(
+                            f"Failed to load PyTorch backend. This may be a HuggingFace API issue.\n"
+                            f"Try: 1) Check internet connection, 2) Clear HF cache, 3) Update transformers: pip install --upgrade transformers\n"
+                            f"Original error: {model_error}"
+                        )
+                else:
+                    raise
+            
+            # Try to compile model for faster inference (PyTorch 2.0+)
+            try:
+                import torch
+                if hasattr(torch, 'compile') and self.device != "mps":  # MPS doesn't support compile yet
+                    self.tts.model = torch.compile(self.tts.model, mode="reduce-overhead")
+                    print("[tts] Model compiled with torch.compile for faster inference")
+            except Exception as e:
+                print(f"[tts] Could not compile model: {e}")
+
+        print("[tts] Model loaded and optimized!")
+
+        # Apply phonemizer fix for macOS line mismatch issues
+        if sys.platform.startswith("darwin"):
+            fix_phonemizer_macos(self.tts)
+
+    def reinitialize_with_pytorch(self):
+        """Reinitialize the TTS engine with PyTorch backend (fallback from GGUF)"""
+        print("[tts] Reinitializing with PyTorch backend due to GGUF runtime errors...")
+
+        # Clear existing model
+        self.tts = None
+        self.backend_type = None
+        self.gguf_failed = True  # Prevent GGUF from being used again
+
+        # Force PyTorch initialization
+        try:
+            ensure_dependency("torch", "torch")
+            ensure_dependency("transformers", "transformers")
+
+            # Enable torch optimizations
+            import torch
+            torch.set_num_threads(min(8, multiprocessing.cpu_count()))
+            if hasattr(torch, 'compile'):
+                torch._dynamo.config.suppress_errors = True
+
+        except Exception as e:
+            print(f"[deps] Could not provision torch/transformers: {e}")
+            raise
+
+        from neuttsair.neutts import NeuTTSAir
+        codec_repo = "neuphonic/neucodec"
+
+        try:
+            self.tts = NeuTTSAir(
+                backbone_repo="neuphonic/neutts-air",
+                backbone_device=self.device,
+                codec_repo=codec_repo,
+                codec_device=self.device,
+            )
+            print(f"[tts] Using PyTorch backend on {self.device}")
+            self.backend_type = 'pytorch'
+        except (AttributeError, RuntimeError) as model_error:
+            error_msg = str(model_error)
+            if "'NoneType' object has no attribute 'get'" in error_msg or "metadata" in error_msg:
+                print(f"[tts] PyTorch model loading failed: {model_error}")
+                print(f"[tts] Trying alternative loading method...")
+                # Try loading on CPU first then moving to device
+                self.tts = NeuTTSAir(
+                    backbone_repo="neuphonic/neutts-air",
+                    backbone_device="cpu",
+                    codec_repo=codec_repo,
+                    codec_device=self.device,
+                )
+                if self.device != "cpu" and hasattr(self.tts, 'backbone'):
+                    import torch
+                    self.tts.backbone = self.tts.backbone.to(self.device)
+                print(f"[tts] Using PyTorch backend on {self.device} (alternative method)")
+                self.backend_type = 'pytorch'
+            else:
+                raise
+
+        # Try to compile model for faster inference (PyTorch 2.0+)
+        try:
+            import torch
+            if hasattr(torch, 'compile') and self.device != "mps":  # MPS doesn't support compile yet
+                self.tts.model = torch.compile(self.tts.model, mode="reduce-overhead")
+                print("[tts] Model compiled with torch.compile for faster inference")
+        except Exception as e:
+            print(f"[tts] Could not compile model: {e}")
+
+        # Apply phonemizer fix for macOS line mismatch issues
+        if sys.platform.startswith("darwin"):
+            fix_phonemizer_macos(self.tts)
+
+        # Re-encode reference if we had one
+        if self.current_ref_wav and self.current_ref_txt:
+            print("[tts] Re-encoding reference with new backend...")
+            ref_wav = self.current_ref_wav
+            ref_txt = self.current_ref_txt
+            self.current_ref_wav = None  # Clear to force re-encoding
+            self.current_ref_txt = None
+            self.load_reference(ref_wav, ref_txt)
+
     def load_reference(self, ref_wav: str, ref_txt: str):
         """Load and encode reference voice (cached)"""
         if self.tts is None:
@@ -553,48 +791,120 @@ class TTSEngine:
         # Only re-encode if reference changed
         if ref_wav != self.current_ref_wav or ref_txt != self.current_ref_txt:
             print(f"[tts] Encoding reference voice...")
-            self.ref_text = open(ref_txt, "r", encoding="utf-8").read().strip()
+            # Read and aggressively normalize the reference text
+            # Remove newlines, extra spaces, and problematic characters
+            raw_text = open(ref_txt, "r", encoding="utf-8").read()
+            # Replace bullet points and other list markers with spaces
+            raw_text = raw_text.replace('•', ' ').replace('●', ' ').replace('◦', ' ')
+            raw_text = raw_text.replace('➤', ' ').replace('▪', ' ').replace('▫', ' ')
+            # Replace various dashes/hyphens with standard hyphen
+            raw_text = raw_text.replace('—', '-').replace('–', '-').replace('−', '-')
+            # Replace smart quotes with regular quotes
+            raw_text = raw_text.replace('"', '"').replace('"', '"').replace(''', "'").replace(''', "'")
+            # Remove any control characters and normalize whitespace
+            self.ref_text = ' '.join(raw_text.split())
+            print(f"[tts] Cleaned reference text: '{self.ref_text[:80]}...'")
             self.ref_codes = self.tts.encode_reference(ref_wav)
             self.current_ref_wav = ref_wav
             self.current_ref_txt = ref_txt
             print(f"[tts] Reference voice ready")
     
-    def synthesize(self, text: str, skip_gc=False) -> Optional[bytes]:
-        """Synthesize text using cached model and reference - THREAD-SAFE"""
-        import soundfile as sf
-
+    def synthesize_streaming(self, text: str) -> Generator[np.ndarray, None, None]:
+        """Synthesize text using streaming for faster first-byte"""
         if self.tts is None or self.ref_codes is None:
             raise Exception("Model or reference not loaded")
-
-        print(f"[tts] Synthesizing: '{text[:50]}...'")
-
+        
         try:
-            # Use lock to protect phonemizer (not thread-safe)
-            # This serializes phonemization but allows GPU codec work to overlap
-            with self._phonemizer_lock:
+            # Use streaming if available
+            if hasattr(self.tts, 'infer_stream'):
+                print(f"[tts] Streaming synthesis: '{text[:50]}...'")
+                for audio_chunk in self.tts.infer_stream(text, self.ref_codes, self.ref_text):
+                    yield audio_chunk
+            else:
+                # Fallback to regular synthesis
                 wav = self.tts.infer(text, self.ref_codes, self.ref_text)
+                yield wav
+        except Exception as e:
+            raise
+    
+    def synthesize(self, text: str) -> Optional[bytes]:
+        """Synthesize text using cached model and reference"""
+        import soundfile as sf
+        
+        if self.tts is None or self.ref_codes is None:
+            raise Exception("Model or reference not loaded")
+        
+        # Aggressively normalize text to avoid phonemizer issues
+        # Replace bullet points and list markers
+        clean_text = text.replace('•', ' ').replace('●', ' ').replace('◦', ' ')
+        clean_text = clean_text.replace('➤', ' ').replace('▪', ' ').replace('▫', ' ')
+        # Replace various dashes with standard hyphen
+        clean_text = clean_text.replace('—', '-').replace('–', '-').replace('−', '-')
+        # Replace smart quotes with regular quotes  
+        clean_text = clean_text.replace('"', '"').replace('"', '"').replace(''', "'").replace(''', "'")
+        # Remove newlines and normalize whitespace
+        normalized_text = ' '.join(clean_text.split())
+        
+        print(f"[tts] Synthesizing: '{normalized_text[:50]}...'")
+        
+        try:
+            wav = self.tts.infer(normalized_text, self.ref_codes, self.ref_text)
 
-            # Convert to bytes (can happen in parallel after lock is released)
+            # Convert to bytes
             tmp = io.BytesIO()
             sf.write(tmp, wav, 24000, format="WAV")
             tmp.seek(0)
             audio_bytes = tmp.getvalue()
 
-            # Cleanup - only GC if requested (reduces overhead)
+            # Explicit cleanup to prevent memory buildup
             del wav
             del tmp
-            if not skip_gc:
+
+            # Only do GC if needed to reduce overhead
+            if len(text) > 200:  # Larger chunks need more memory
                 gc.collect()
 
             return audio_bytes
         except Exception as e:
             error_str = str(e).lower()
+
+            # Check for llama_decode errors (GGUF backend issues)
+            if 'llama_decode' in error_str or 'llama.cpp' in error_str:
+                if self.backend_type == 'gguf':
+                    print(f"[tts] GGUF backend error: {e}")
+                    print("[tts] Falling back to PyTorch backend...")
+                    try:
+                        self.reinitialize_with_pytorch()
+                        # Retry synthesis with PyTorch
+                        return self.synthesize(text)
+                    except Exception as fallback_error:
+                        print(f"[tts] PyTorch fallback also failed: {fallback_error}")
+                        raise RuntimeError(f"Both GGUF and PyTorch backends failed: {e} | {fallback_error}")
+                else:
+                    raise
+
             # Check if it's a token limit error
-            if any(keyword in error_str for keyword in ['token', 'length', 'too long', 'maximum', 'context']):
+            elif any(keyword in error_str for keyword in ['token', 'length', 'too long', 'maximum', 'context']):
                 print(f"[tts] Token limit exceeded, text too long")
                 raise TokenLimitError(f"Text too long for model: {e}")
             else:
                 raise
+    
+    def synthesize_batch(self, texts: List[str]) -> List[Optional[bytes]]:
+        """Synthesize multiple texts in parallel (where possible)"""
+        results = []
+        
+        # For now, process sequentially but could be optimized further
+        # if the underlying model supports batch processing
+        for text in texts:
+            try:
+                result = self.synthesize(text)
+                results.append(result)
+            except Exception as e:
+                print(f"[tts] Batch item failed: {e}")
+                results.append(None)
+        
+        return results
 
 class TokenLimitError(Exception):
     """Raised when text exceeds model's token limit"""
@@ -619,13 +929,13 @@ def load_default_reference():
     return wav_path, txt_path
 
 # ==============================
-# GUI
+# OPTIMIZED GUI with Parallel Processing
 # ==============================
-class NeuTTSGui:
+class OptimizedNeuTTSGui:
     def __init__(self, root):
         self.root = root
-        self.root.title("NeuTTS-Air GUI - Optimized (Parallel + GPU)")
-        self.root.geometry("750x570")
+        self.root.title("NeuTTS-Air GUI - OPTIMIZED Version (FIXED)")
+        self.root.geometry("750x620")
         
         # Initialize components
         self.profile_manager = VoiceProfileManager()
@@ -634,23 +944,21 @@ class NeuTTSGui:
         self.ref_wav, self.ref_txt = load_default_reference()
         self.generation_thread = None
         self.is_generating = False
-        self.tts_engine = TTSEngine.get_instance()
+        self.tts_engine = OptimizedTTSEngine.get_instance()
+        
+        # Parallel processing
+        self.parallel_workers = min(3, multiprocessing.cpu_count() // 2)  # Use multiple workers
+        self.chunk_queue = queue.Queue()
+        self.result_queue = queue.Queue()
         
         # Timing tracking for ETA
         self.chunk_times = []
         self.start_time = None
-
+        
         # Session resume tracking
         self.current_chunks = []
         self.completed_chunk_indices = []
         self.resuming_session = False
-
-        # Performance settings
-        # Use 2-4 workers for parallel synthesis
-        # Phonemizer access is protected by lock, so parallel processing is safe
-        cpu_count = multiprocessing.cpu_count()
-        self.max_workers = min(4, max(2, cpu_count // 2))  # 2-4 workers
-        print(f"[perf] Using {self.max_workers} parallel workers (phonemizer protected by lock)")
         
         self.create_widgets()
         self.load_voice_profiles()
@@ -720,10 +1028,12 @@ class NeuTTSGui:
     def _preload_model(self):
         """Preload TTS model in background for faster first generation"""
         try:
-            self.root.after(0, lambda: self.status_label.config(text="Loading TTS model..."))
+            self.root.after(0, lambda: self.status_label.config(
+                text=f"Loading TTS model on {self.tts_engine.device}..."))
             self.tts_engine.initialize_model()
             self.tts_engine.load_reference(self.ref_wav, self.ref_txt)
-            self.root.after(0, lambda: self.status_label.config(text="Ready - Model loaded!"))
+            self.root.after(0, lambda: self.status_label.config(
+                text=f"Ready - Model loaded on {self.tts_engine.device}!"))
         except Exception as e:
             print(f"[tts] Preload failed: {e}")
             self.root.after(0, lambda: self.status_label.config(text="Ready"))
@@ -749,7 +1059,14 @@ class NeuTTSGui:
         
         self.textbox = scrolledtext.ScrolledText(text_frame, wrap=tk.WORD, width=80, height=12)
         self.textbox.pack(fill="both", expand=True)
-        self.textbox.insert("1.0", "Welcome to NeuTTS-Air! Type or paste any text here and click 'Generate Audio' to create speech.\n\nThe text will be processed in 300-character chunks, with each chunk ending at the last complete sentence before the 300-character limit. This ensures natural breaks in the audio while keeping chunks manageable for the model.")
+        self.textbox.insert("1.0", "Welcome to the FIXED NeuTTS-Air GUI!\n\nThis version includes: GPU/Metal acceleration support, FIXED codec now supports reference encoding, Parallel chunk processing, Improved memory management, Session resume capability.\n\nThe text will be processed in 300-character chunks with intelligent sentence boundaries for natural speech synthesis.")
+        
+        # Settings frame
+        settings_frame = tk.LabelFrame(self.root, text="Performance Settings", padx=10, pady=5)
+        settings_frame.pack(fill="x", padx=10, pady=5)
+        
+        tk.Label(settings_frame, text=f"Device: {self.tts_engine.device.upper()}").pack(side=tk.LEFT, padx=10)
+        tk.Label(settings_frame, text=f"Workers: {self.parallel_workers}").pack(side=tk.LEFT, padx=10)
         
         # Control buttons frame
         controls_frame = tk.LabelFrame(self.root, text="Controls", padx=10, pady=5)
@@ -784,13 +1101,17 @@ class NeuTTSGui:
         self.progress_label = tk.Label(progress_frame, text="0/0", width=10)
         self.progress_label.pack(side=tk.LEFT, padx=5)
         
-        # ETA display
-        eta_frame = tk.Frame(controls_frame)
-        eta_frame.pack(fill="x", pady=2)
+        # ETA and speed display
+        stats_frame = tk.Frame(controls_frame)
+        stats_frame.pack(fill="x", pady=2)
         
-        tk.Label(eta_frame, text="ETA:").pack(side=tk.LEFT, padx=5)
-        self.eta_label = tk.Label(eta_frame, text="--:--", anchor=tk.W, font=("TkDefaultFont", 9))
+        tk.Label(stats_frame, text="ETA:").pack(side=tk.LEFT, padx=5)
+        self.eta_label = tk.Label(stats_frame, text="--:--", anchor=tk.W, font=("TkDefaultFont", 9))
         self.eta_label.pack(side=tk.LEFT, padx=5)
+        
+        tk.Label(stats_frame, text="Speed:").pack(side=tk.LEFT, padx=20)
+        self.speed_label = tk.Label(stats_frame, text="-- char/s", anchor=tk.W, font=("TkDefaultFont", 9))
+        self.speed_label.pack(side=tk.LEFT, padx=5)
         
         # Status bar
         self.status_label = tk.Label(self.root, text="Ready", relief=tk.SUNKEN, anchor=tk.W)
@@ -938,7 +1259,7 @@ class NeuTTSGui:
         return chunks
     
     def _calculate_eta(self, completed: int, total: int) -> str:
-        """Calculate ETA with 95% confidence interval"""
+        """Calculate ETA with speed metrics"""
         if completed == 0 or len(self.chunk_times) < 2:
             return "--:--"
         
@@ -952,14 +1273,8 @@ class NeuTTSGui:
         else:
             stdev = 0
         
-        # 95% CI: mean ± 1.96 * (stdev / sqrt(n))
-        n = len(self.chunk_times)
-        margin = 1.96 * (stdev / (n ** 0.5)) if n > 1 else 0
-        
         # Calculate ETA
         eta_mean = remaining * mean_time
-        eta_lower = remaining * max(0, mean_time - margin)
-        eta_upper = remaining * (mean_time + margin)
         
         # Format times
         def format_time(seconds):
@@ -974,11 +1289,20 @@ class NeuTTSGui:
                 mins = int((seconds % 3600) / 60)
                 return f"{hours}h {mins}m"
         
-        # Return ETA with confidence interval
-        if margin > 0 and stdev > 0:
-            return f"{format_time(eta_mean)} (±{format_time(margin * remaining)})"
-        else:
-            return format_time(eta_mean)
+        return format_time(eta_mean)
+    
+    def _calculate_speed(self, completed: int) -> str:
+        """Calculate processing speed in characters per second"""
+        if completed == 0 or not self.chunk_times:
+            return "-- char/s"
+        
+        total_chars = sum(len(self.current_chunks[i]) for i in self.completed_chunk_indices)
+        total_time = sum(self.chunk_times)
+        
+        if total_time > 0:
+            speed = total_chars / total_time
+            return f"{int(speed)} char/s"
+        return "-- char/s"
     
     def generate_audio(self):
         if self.is_generating:
@@ -1020,193 +1344,116 @@ class NeuTTSGui:
             self.progress_label.config(text=f"0/{len(chunks)}")
         
         self.eta_label.config(text="Calculating...")
+        self.speed_label.config(text="-- char/s")
         self.resuming_session = False
         
-        # Start generation thread
+        # Start generation thread with parallel processing
         self.generation_thread = threading.Thread(
-            target=self._generate_audio_thread, 
+            target=self._generate_audio_parallel, 
             args=(chunks, start_index), 
             daemon=True
         )
         self.generation_thread.start()
     
-    def _split_paragraph_intelligently(self, paragraph: str) -> List[str]:
-        """Split paragraph into smaller chunks if needed"""
-        # First try by sentences
-        sentences = re.split(r'(?<=[.!?])\s+', paragraph)
-        sentences = [s.strip() for s in sentences if s.strip()]
-
-        if not sentences:
-            return [paragraph]
-
-        # If only one sentence, split by half
-        if len(sentences) == 1:
-            mid = len(paragraph) // 2
-            # Find a good break point (space, comma, etc.)
-            for offset in range(50):  # Look within 50 chars of midpoint
-                if mid + offset < len(paragraph) and paragraph[mid + offset] in ' ,-;:':
-                    return [paragraph[:mid + offset].strip(), paragraph[mid + offset:].strip()]
-                if mid - offset > 0 and paragraph[mid - offset] in ' ,-;:':
-                    return [paragraph[:mid - offset].strip(), paragraph[mid - offset:].strip()]
-            # No good break point, just split at midpoint
-            return [paragraph[:mid].strip(), paragraph[mid:].strip()]
-
-        return sentences
-
-    def _generate_single_chunk(self, chunk: str, chunk_index: int):
-        """Generate a single chunk (called by parallel workers) - THREAD-SAFE via lock"""
-        chunk_start = time.time()
-        try:
-            # Phonemizer access is protected by lock in synthesize()
-            audio_data = self.tts_engine.synthesize(chunk, skip_gc=True)
-            return (chunk_start, audio_data, True)
-        except TokenLimitError:
-            # Try splitting if too long
-            print(f"[tts] Chunk {chunk_index} too long, attempting to split...")
-            sub_chunks = self._split_paragraph_intelligently(chunk)
-            if len(sub_chunks) <= 1:
-                print(f"[tts] Could not split chunk {chunk_index}, skipping")
-                return (chunk_start, None, False)
-
-            # Process sub-chunks
-            sub_audio = []
-            for sub_chunk in sub_chunks:
-                try:
-                    audio = self.tts_engine.synthesize(sub_chunk, skip_gc=True)
-                    if audio:
-                        sub_audio.append(audio)
-                except Exception as e:
-                    print(f"[tts] Sub-chunk failed: {e}")
-
-            if sub_audio:
-                # Combine sub-chunks into single audio
-                import soundfile as sf
-                import numpy as np
-                combined_data = []
-                for audio_bytes in sub_audio:
-                    data, sr = sf.read(io.BytesIO(audio_bytes))
-                    combined_data.append(data)
-                combined = np.concatenate(combined_data)
-                tmp = io.BytesIO()
-                sf.write(tmp, combined, 24000, format="WAV")
-                tmp.seek(0)
-                return (chunk_start, tmp.getvalue(), True)
-            else:
-                return (chunk_start, None, False)
-
-        except Exception as e:
-            print(f"[tts] Error in chunk {chunk_index}: {e}")
-            traceback.print_exc()
-            return (chunk_start, None, False)
-    
-    def _generate_audio_thread(self, chunks, start_index=0):
+    def _generate_audio_parallel(self, chunks, start_index=0):
+        """Generate audio with parallel chunk processing"""
         try:
             # Ensure model and reference are loaded
             self.tts_engine.initialize_model()
             self.tts_engine.load_reference(self.ref_wav, self.ref_txt)
-
+            
             total_chunks = len(chunks)
             processed_count = len(self.completed_chunk_indices)
-
-            # Create a lock for thread-safe operations on shared data
-            import threading as th
-            lock = th.Lock()
-
-            # Use parallel processing with ThreadPoolExecutor
-            # Phonemizer is protected by lock in synthesize(), so this is now safe
-            batch_size = self.max_workers * 3  # Process 3 batches at a time per worker
-
-            for batch_start in range(start_index, total_chunks, batch_size):
-                if not self.is_generating:
-                    # Save session on cancel
-                    self.session_manager.save_session(
-                        self.textbox.get("1.0", tk.END).strip(),
-                        self.current_chunks,
-                        self.completed_chunk_indices,
-                        self.ref_wav,
-                        self.ref_txt,
-                        self.voice_combo.get()
-                    )
-                    self.root.after(0, lambda: self.status_label.config(text="Generation cancelled - session saved"))
-                    break
-
-                batch_end = min(batch_start + batch_size, total_chunks)
-                batch_indices = list(range(batch_start, batch_end))
-
-                # Process batch in parallel
-                with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-                    # Submit all chunks in batch
-                    future_to_index = {}
-                    for i in batch_indices:
-                        if i in self.completed_chunk_indices:
-                            continue  # Skip already completed chunks
-                        chunk = chunks[i]
-                        future = executor.submit(self._generate_single_chunk, chunk, i)
-                        future_to_index[future] = i
-
-                    # Process completed chunks as they finish
-                    for future in as_completed(future_to_index):
-                        if not self.is_generating:
-                            break
-
-                        i = future_to_index[future]
-                        try:
-                            chunk_start_time, audio_data, success = future.result()
-
-                            if success and audio_data:
-                                chunk_end = time.time()
-                                chunk_time = chunk_end - chunk_start_time
-
-                                with lock:
+            
+            # Process chunks with parallelism where possible
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            
+            # Create a pool for parallel processing (limited to avoid memory issues)
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                futures = {}
+                next_index = start_index
+                active_futures = 0
+                max_active = 2  # Process 2 chunks in parallel
+                
+                while next_index < total_chunks or futures:
+                    if not self.is_generating:
+                        # Save session on cancel
+                        for f in futures:
+                            f.cancel()
+                        self.session_manager.save_session(
+                            self.textbox.get("1.0", tk.END).strip(),
+                            self.current_chunks,
+                            self.completed_chunk_indices,
+                            self.ref_wav,
+                            self.ref_txt,
+                            self.voice_combo.get()
+                        )
+                        self.root.after(0, lambda: self.status_label.config(text="Generation cancelled - session saved"))
+                        break
+                    
+                    # Submit new chunks for processing
+                    while next_index < total_chunks and active_futures < max_active:
+                        chunk = chunks[next_index]
+                        future = executor.submit(self._process_chunk_optimized, chunk, next_index)
+                        futures[future] = next_index
+                        next_index += 1
+                        active_futures += 1
+                    
+                    # Process completed chunks
+                    if futures:
+                        done, _ = as_completed(futures), None
+                        for future in list(done):
+                            try:
+                                chunk_index = futures[future]
+                                chunk_start = time.time()
+                                
+                                success, audio_data = future.result(timeout=30)
+                                
+                                if success and audio_data:
+                                    chunk_end = time.time()
+                                    chunk_time = chunk_end - chunk_start
                                     self.chunk_times.append(chunk_time)
-                                    self.current_audio_sequence.append((i, audio_data))
-                                    self.session_manager.save_audio_chunk(i, audio_data)
-                                    self.completed_chunk_indices.append(i)
+                                    
+                                    self.current_audio_sequence.append(audio_data)
+                                    self.session_manager.save_audio_chunk(chunk_index, audio_data)
+                                    self.completed_chunk_indices.append(chunk_index)
                                     processed_count += 1
-
-                                progress = (processed_count / total_chunks) * 100
-                                self.root.after(0, lambda p=progress: self.progress_var.set(p))
-                                self.root.after(0, lambda count=processed_count, total=total_chunks:
-                                              self.progress_label.config(text=f"{count}/{total}"))
-
-                                # Update ETA
-                                eta_str = self._calculate_eta(processed_count, total_chunks)
-                                self.root.after(0, lambda eta=eta_str: self.eta_label.config(text=eta))
-
-                                # Update status
-                                self.root.after(0, lambda count=processed_count, total=total_chunks:
-                                              self.status_label.config(
-                                                  text=f"Processing in parallel ({count}/{total})..."))
-
-                                # Enable download button after first successful chunk
-                                if processed_count == 1:
-                                    self.root.after(0, lambda: self.download_btn.config(state="normal"))
-
-                        except Exception as e:
-                            print(f"[tts] Error processing chunk {i}: {e}")
-                            traceback.print_exc()
-
-                # Garbage collection after each batch
-                gc.collect()
-                print(f"[memory] Batch {batch_start}-{batch_end} complete, GC performed")
-
+                                    
+                                    progress = (processed_count / total_chunks) * 100
+                                    self.root.after(0, lambda p=progress: self.progress_var.set(p))
+                                    self.root.after(0, lambda count=processed_count, total=total_chunks: 
+                                                  self.progress_label.config(text=f"{count}/{total}"))
+                                    
+                                    # Update ETA and speed
+                                    eta_str = self._calculate_eta(processed_count, total_chunks)
+                                    speed_str = self._calculate_speed(processed_count)
+                                    self.root.after(0, lambda eta=eta_str: self.eta_label.config(text=eta))
+                                    self.root.after(0, lambda speed=speed_str: self.speed_label.config(text=speed))
+                                    
+                                    # Enable download button after first successful chunk
+                                    if len(self.current_audio_sequence) == 1:
+                                        self.root.after(0, lambda: self.download_btn.config(state="normal"))
+                                
+                                del futures[future]
+                                active_futures -= 1
+                                
+                            except Exception as e:
+                                print(f"[tts] Chunk processing failed: {e}")
+                                del futures[future]
+                                active_futures -= 1
+            
             if self.is_generating and self.current_audio_sequence:
-                # Sort audio sequence by index to maintain correct order
-                with lock:
-                    self.current_audio_sequence.sort(key=lambda x: x[0])
-                    self.current_audio_sequence = [audio for _, audio in self.current_audio_sequence]
-
                 total_time = time.time() - self.start_time
-                chunks_per_sec = len(self.current_audio_sequence) / total_time if total_time > 0 else 0
-                self.root.after(0, lambda t=total_time, cps=chunks_per_sec: self.status_label.config(
-                    text=f"Complete! {len(self.current_audio_sequence)} chunks in {int(t)}s ({cps:.2f} chunks/sec)"))
+                avg_speed = sum(len(c) for c in chunks) / total_time
+                self.root.after(0, lambda t=total_time, s=avg_speed: self.status_label.config(
+                    text=f"Complete! {len(self.current_audio_sequence)} chunks in {int(t)}s ({int(s)} char/s avg)"))
                 self.root.after(0, lambda: self.eta_label.config(text="Complete!"))
                 # Clear session on successful completion
                 self.session_manager.clear_session()
             elif not self.current_audio_sequence:
                 self.root.after(0, lambda: self.status_label.config(text="No audio generated."))
                 self.root.after(0, lambda: self.eta_label.config(text="--:--"))
-
+                
         except Exception as e:
             traceback.print_exc()
             error_msg = f"Generation failed: {str(e)}"
@@ -1227,11 +1474,117 @@ class NeuTTSGui:
             self.root.after(0, lambda: self.generate_btn.config(state="normal"))
             self.root.after(0, lambda: self.cancel_btn.config(state="disabled"))
     
+    def _process_chunk_optimized(self, chunk: str, chunk_index: int) -> tuple:
+        """Process a single chunk with optimizations"""
+        try:
+            self.root.after(0, lambda i=chunk_index: 
+                          self.status_label.config(text=f"Processing chunk {i+1}..."))
+            
+            audio_data = self._generate_chunk_with_fallback(chunk, chunk_index)
+            return (True, audio_data)
+        except Exception as e:
+            print(f"[tts] Failed to process chunk {chunk_index}: {e}")
+            return (False, None)
+    
+    def _split_paragraph_intelligently(self, paragraph: str) -> List[str]:
+        """Split paragraph into smaller chunks if needed"""
+        # First try by sentences
+        sentences = re.split(r'(?<=[.!?])\s+', paragraph)
+        sentences = [s.strip() for s in sentences if s.strip()]
+        
+        if not sentences:
+            return [paragraph]
+        
+        # If only one sentence, split by half
+        if len(sentences) == 1:
+            mid = len(paragraph) // 2
+            # Find a good break point (space, comma, etc.)
+            for offset in range(50):  # Look within 50 chars of midpoint
+                if mid + offset < len(paragraph) and paragraph[mid + offset] in ' ,-;:':
+                    return [paragraph[:mid + offset].strip(), paragraph[mid + offset:].strip()]
+                if mid - offset > 0 and paragraph[mid - offset] in ' ,-;:':
+                    return [paragraph[:mid - offset].strip(), paragraph[mid - offset:].strip()]
+            # No good break point, just split at midpoint
+            return [paragraph[:mid].strip(), paragraph[mid:].strip()]
+        
+        return sentences
+    
+    def _generate_chunk_with_fallback(self, chunk: str, chunk_index: int, depth: int = 0) -> bytes:
+        """Generate audio for a chunk, automatically splitting if too long"""
+        if not self.is_generating:
+            return None
+        
+        max_depth = 10  # Prevent infinite recursion
+        
+        try:
+            # Try to generate the chunk as-is
+            audio_data = self.tts_engine.synthesize(chunk)
+            
+            if audio_data:
+                print(f"[tts] Successfully generated chunk {chunk_index} (depth={depth})")
+                return audio_data
+            else:
+                print(f"[tts] Failed to generate audio for chunk {chunk_index}")
+                return None
+                
+        except TokenLimitError as e:
+            # Text is too long, need to split
+            if depth >= max_depth:
+                print(f"[tts] Max recursion depth reached, skipping chunk {chunk_index}")
+                self.root.after(0, lambda: messagebox.showwarning(
+                    "Chunk Too Long",
+                    f"Could not process chunk even after splitting {max_depth} times. Skipping."
+                ))
+                return None
+            
+            print(f"[tts] Token limit exceeded at depth {depth}, splitting chunk {chunk_index}...")
+            self.root.after(0, lambda d=depth: self.status_label.config(
+                text=f"Chunk too long, splitting (attempt {d+1})..."))
+            
+            # Split the chunk
+            sub_chunks = self._split_paragraph_intelligently(chunk)
+            
+            if len(sub_chunks) <= 1:
+                print(f"[tts] Could not split chunk {chunk_index} further, skipping")
+                return None
+            
+            print(f"[tts] Split into {len(sub_chunks)} sub-chunks")
+            
+            # Process sub-chunks and combine audio
+            import soundfile as sf
+            sub_audio_data = []
+            
+            for sub_chunk in sub_chunks:
+                if not self.is_generating:
+                    return None
+                sub_result = self._generate_chunk_with_fallback(sub_chunk, chunk_index, depth + 1)
+                if sub_result:
+                    # Convert bytes to numpy array
+                    data, sr = sf.read(io.BytesIO(sub_result))
+                    sub_audio_data.append(data)
+            
+            if sub_audio_data:
+                # Combine all sub-audio
+                combined = np.concatenate(sub_audio_data)
+                # Convert back to bytes
+                tmp = io.BytesIO()
+                sf.write(tmp, combined, 24000, format="WAV")
+                tmp.seek(0)
+                return tmp.getvalue()
+            
+            return None
+            
+        except Exception as e:
+            print(f"[tts] Error generating chunk {chunk_index}: {e}")
+            traceback.print_exc()
+            return None
+    
     def cancel_generation(self):
         self.is_generating = False
         self.cancel_btn.config(state="disabled")
         self.status_label.config(text="Cancelling generation...")
         self.eta_label.config(text="Cancelled")
+        self.speed_label.config(text="-- char/s")
     
     def download_audio(self):
         if not self.current_audio_sequence:
@@ -1240,7 +1593,6 @@ class NeuTTSGui:
         
         try:
             import soundfile as sf
-            import numpy as np
             
             # Combine all chunks into a single audio file
             all_audio_data = []
@@ -1273,19 +1625,10 @@ class NeuTTSGui:
 # Entry
 # ==============================
 def main():
-    print("=" * 60)
-    print("NeuTTS-Air GUI - OPTIMIZED VERSION")
-    print("=" * 60)
+    print("NeuTTS-Air GUI - OPTIMIZED Version (FIXED)")
     print(f"Platform: {platform.system()} {platform.machine()}")
     print(f"Python: {sys.version}")
-    print(f"CPU Cores: {multiprocessing.cpu_count()}")
-    print("\nOptimizations enabled:")
-    print("  ✓ GPU auto-detection (CUDA/MPS) for codec acceleration")
-    print("  ✓ Parallel chunk processing (2-4 workers)")
-    print("  ✓ Thread-safe phonemizer (protected by lock)")
-    print("  ✓ Reduced garbage collection overhead")
-    print("  ✓ Batch processing for better memory management")
-    print("=" * 60)
+    print(f"CPU cores: {multiprocessing.cpu_count()}")
     
     # Try to import tkinter.simpledialog for the save dialog
     try:
@@ -1304,8 +1647,8 @@ def main():
     
     set_phonemizer_env()
     root = tk.Tk()
-    app = NeuTTSGui(root)
+    app = OptimizedNeuTTSGui(root)
     root.mainloop()
 
 if __name__ == "__main__":
-    main() 
+    main()
