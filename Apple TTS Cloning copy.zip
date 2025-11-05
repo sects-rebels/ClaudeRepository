@@ -1,0 +1,713 @@
+#!/usr/bin/env python3
+"""
+NeuTTS-Air GUI - PHONEMIZER FIXED VERSION
+Major fix: Aggressive text normalization prevents phonemizer line-splitting errors
+"""
+import os
+import sys
+import io
+import json
+import subprocess
+import importlib
+import zipfile
+import urllib.request
+from typing import Optional, Callable, Dict, List
+import threading
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, scrolledtext
+import shutil
+import glob
+import traceback
+import platform
+from datetime import datetime
+import re
+import time
+import statistics
+import gc
+import multiprocessing
+import numpy as np
+
+# ==============================
+# Dependency helpers
+# ==============================
+def run_cmd(args, check=False) -> int:
+    try:
+        subprocess.check_call(args)
+        return 0
+    except subprocess.CalledProcessError as e:
+        if check:
+            raise
+        return e.returncode
+
+def pip_install(spec: str, quiet=False, extra_args=None):
+    cmd = [sys.executable, "-m", "pip", "install", spec]
+    if extra_args:
+        cmd.extend(extra_args)
+    if quiet:
+        subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        subprocess.check_call(cmd)
+
+def ensure_dependency(import_name: str, install_spec: str, fallback: Optional[Callable] = None, quiet=False, extra_args=None) -> None:
+    try:
+        importlib.import_module(import_name)
+        return
+    except ModuleNotFoundError:
+        print(f"[deps] Missing '{import_name}'. Installing {install_spec} …")
+        try:
+            pip_install(install_spec, quiet=quiet, extra_args=extra_args)
+        except Exception as e:
+            print(f"[deps] pip install failed for '{import_name}': {e}")
+            if fallback:
+                fallback()
+            else:
+                raise
+        importlib.invalidate_caches()
+
+def install_neuttsair_from_source():
+    print("[deps] Falling back to ZIP: downloading NeuTTS-Air source …")
+    repo_url = "https://github.com/neuphonic/neutts-air/archive/refs/heads/main.zip"
+    dest_dir = os.path.expanduser("~/.neuttsair_source")
+    os.makedirs(dest_dir, exist_ok=True)
+    zip_path = os.path.join(dest_dir, "neutts_air.zip")
+    urllib.request.urlretrieve(repo_url, zip_path)
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        zf.extractall(dest_dir)
+    src_path = os.path.join(dest_dir, "neutts-air-main")
+    if src_path not in sys.path:
+        sys.path.append(src_path)
+    print(f"[deps] Added {src_path} to sys.path")
+
+# ==============================
+# eSpeak setup
+# ==============================
+def set_phonemizer_env():
+    """Configure phonemizer environment variables"""
+    if sys.platform.startswith("darwin"):
+        # Try to find espeak via brew
+        for formula in ["espeak-ng", "espeak"]:
+            try:
+                brew = shutil.which("brew") or "/opt/homebrew/bin/brew"
+                if os.path.exists(brew):
+                    prefix = subprocess.check_output([brew, "--prefix", formula], text=True).strip()
+                    lib_path = os.path.join(prefix, "lib", "libespeak-ng.dylib")
+                    if os.path.exists(lib_path):
+                        os.environ["PHONEMIZER_ESPEAK_LIBRARY"] = lib_path
+                        os.environ["ESPEAK_LIBRARY"] = lib_path
+                        bin_dir = os.path.join(prefix, "bin")
+                        if os.path.exists(bin_dir):
+                            os.environ["PHONEMIZER_ESPEAK_PATH"] = bin_dir
+                        return
+            except:
+                pass
+
+def ensure_espeak_installed():
+    """Ensure eSpeak is installed"""
+    have_bin = shutil.which("espeak") or shutil.which("espeak-ng")
+    if not have_bin:
+        print("[deps] Please install eSpeak:")
+        if sys.platform.startswith("darwin"):
+            print("  brew install espeak-ng")
+        elif sys.platform.startswith("linux"):
+            print("  sudo apt-get install espeak-ng")
+    set_phonemizer_env()
+
+def get_best_device():
+    """Detect best available device"""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return "cuda"
+        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            return "mps"
+    except:
+        pass
+    return "cpu"
+
+def ensure_all_dependencies():
+    """Install all required dependencies"""
+    ensure_dependency("numpy", "numpy")
+    ensure_dependency("soundfile", "soundfile")
+    ensure_dependency("phonemizer", "phonemizer>=3.3.0")
+    ensure_dependency("librosa", "librosa")
+    ensure_dependency("huggingface_hub", "huggingface_hub>=0.25.2")
+    ensure_dependency("safetensors", "safetensors")
+    
+    try:
+        ensure_dependency("llama_cpp", "llama-cpp-python")
+    except:
+        print("[deps] llama-cpp-python failed, will use PyTorch")
+    
+    ensure_dependency("perth", "resemble-perth==1.0.1")
+    ensure_dependency("neucodec", "neucodec>=0.0.4")
+    ensure_espeak_installed()
+    ensure_dependency("neuttsair", "git+https://github.com/neuphonic/neutts-air.git",
+                      fallback=install_neuttsair_from_source)
+
+# ==============================
+# Voice Profile Manager
+# ==============================
+class VoiceProfileManager:
+    def __init__(self):
+        self.profiles_dir = os.path.expanduser("~/.neuttsair_profiles")
+        self.profiles_file = os.path.join(self.profiles_dir, "profiles.json")
+        os.makedirs(self.profiles_dir, exist_ok=True)
+        self.profiles = self.load_profiles()
+    
+    def load_profiles(self) -> Dict:
+        if os.path.exists(self.profiles_file):
+            try:
+                with open(self.profiles_file, 'r') as f:
+                    return json.load(f)
+            except:
+                return {}
+        return {}
+    
+    def save_profiles(self):
+        try:
+            with open(self.profiles_file, 'w') as f:
+                json.dump(self.profiles, f, indent=2)
+        except Exception as e:
+            print(f"[profiles] Save failed: {e}")
+    
+    def add_profile(self, name: str, wav_path: str, txt_path: str) -> bool:
+        try:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            safe_name = "".join(c for c in name if c.isalnum() or c in (' ', '-', '_')).rstrip()
+            
+            profile_wav = os.path.join(self.profiles_dir, f"{safe_name}_{timestamp}.wav")
+            profile_txt = os.path.join(self.profiles_dir, f"{safe_name}_{timestamp}.txt")
+            
+            shutil.copy2(wav_path, profile_wav)
+            shutil.copy2(txt_path, profile_txt)
+            
+            self.profiles[name] = {"wav": profile_wav, "txt": profile_txt, "created": timestamp}
+            self.save_profiles()
+            return True
+        except Exception as e:
+            print(f"[profiles] Add failed: {e}")
+            return False
+    
+    def get_profile(self, name: str) -> Optional[tuple]:
+        if name in self.profiles:
+            profile = self.profiles[name]
+            if os.path.exists(profile["wav"]) and os.path.exists(profile["txt"]):
+                return (profile["wav"], profile["txt"])
+        return None
+    
+    def list_profiles(self) -> List[str]:
+        return list(self.profiles.keys())
+    
+    def delete_profile(self, name: str) -> bool:
+        if name in self.profiles:
+            try:
+                profile = self.profiles[name]
+                if os.path.exists(profile["wav"]):
+                    os.remove(profile["wav"])
+                if os.path.exists(profile["txt"]):
+                    os.remove(profile["txt"])
+                del self.profiles[name]
+                self.save_profiles()
+                return True
+            except Exception as e:
+                print(f"[profiles] Delete failed: {e}")
+        return False
+
+# ==============================
+# TTS Engine with Phonemizer Fix
+# ==============================
+class TTSEngine:
+    """TTS engine with aggressive phonemizer-safe text normalization"""
+    _instance = None
+    
+    def __init__(self):
+        if TTSEngine._instance is not None:
+            raise Exception("Use TTSEngine.get_instance()")
+        
+        self.tts = None
+        self.current_ref_wav = None
+        self.current_ref_txt = None
+        self.ref_codes = None
+        self.ref_text = None
+        self.device = get_best_device()
+        
+    @staticmethod
+    def get_instance():
+        if TTSEngine._instance is None:
+            TTSEngine._instance = TTSEngine()
+        return TTSEngine._instance
+    
+    def _normalize_for_phonemizer(self, text: str) -> str:
+        """CRITICAL: Normalize text to prevent phonemizer line-splitting errors"""
+        # Remove unicode punctuation
+        text = text.replace('•', ' ').replace('●', ' ').replace('◦', ' ')
+        text = text.replace('➤', ' ').replace('▪', ' ').replace('▫', ' ')
+        text = text.replace('—', ' ').replace('–', ' ').replace('−', ' ')
+        text = text.replace('"', '"').replace('"', '"').replace(''', "'").replace(''', "'")
+        text = text.replace('…', '...').replace('−', '-')
+        
+        # Remove newlines and control characters
+        text = text.replace('\n', ' ').replace('\r', ' ').replace('\t', ' ')
+        text = ''.join(char if ord(char) >= 32 else ' ' for char in text)
+        
+        # Simplify punctuation - keep only basic ones
+        text = re.sub(r'\.{2,}', '.', text)
+        text = re.sub(r'[^\w\s\.,!?\'-]', '', text)
+        
+        # Normalize whitespace
+        text = ' '.join(text.split())
+        
+        return text
+    
+    def initialize_model(self):
+        """Load TTS model"""
+        if self.tts is not None:
+            return
+        
+        print(f"[tts] Loading model on {self.device}...")
+        from neuttsair.neutts import NeuTTSAir
+        
+        # Try GGUF first (fastest)
+        try:
+            import llama_cpp
+            self.tts = NeuTTSAir(
+                backbone_repo="neuphonic/neutts-air-q4-gguf",
+                backbone_device="cpu",
+                codec_repo="neuphonic/neucodec",
+                codec_device=self.device,
+            )
+            print("[tts] Using GGUF backend")
+            return
+        except:
+            print("[tts] GGUF unavailable, using PyTorch...")
+        
+        # Fallback to PyTorch
+        ensure_dependency("torch", "torch")
+        ensure_dependency("transformers", "transformers")
+        
+        self.tts = NeuTTSAir(
+            backbone_repo="neuphonic/neutts-air",
+            backbone_device=self.device,
+            codec_repo="neuphonic/neucodec",
+            codec_device=self.device,
+        )
+        print(f"[tts] Using PyTorch on {self.device}")
+    
+    def load_reference(self, ref_wav: str, ref_txt: str):
+        """Load reference voice with phonemizer-safe normalization"""
+        if self.tts is None:
+            self.initialize_model()
+        
+        if ref_wav != self.current_ref_wav or ref_txt != self.current_ref_txt:
+            print("[tts] Encoding reference...")
+            
+            raw_text = open(ref_txt, "r", encoding="utf-8").read()
+            self.ref_text = self._normalize_for_phonemizer(raw_text)
+            
+            print(f"[tts] Normalized ref: '{self.ref_text[:60]}...'")
+            self.ref_codes = self.tts.encode_reference(ref_wav)
+            self.current_ref_wav = ref_wav
+            self.current_ref_txt = ref_txt
+            print("[tts] Reference ready")
+    
+    def synthesize(self, text: str) -> Optional[bytes]:
+        """Synthesize with phonemizer-safe text"""
+        import soundfile as sf
+        
+        if self.tts is None or self.ref_codes is None:
+            raise Exception("Model not initialized")
+        
+        # Apply same normalization
+        normalized = self._normalize_for_phonemizer(text)
+        print(f"[tts] Synthesizing: '{normalized[:50]}...'")
+        
+        try:
+            wav = self.tts.infer(normalized, self.ref_codes, self.ref_text)
+            
+            tmp = io.BytesIO()
+            sf.write(tmp, wav, 24000, format="WAV")
+            tmp.seek(0)
+            audio_bytes = tmp.getvalue()
+            
+            del wav
+            del tmp
+            gc.collect()
+            
+            return audio_bytes
+            
+        except RuntimeError as e:
+            # If phonemizer still fails, remove ALL punctuation
+            if 'number of lines' in str(e):
+                print("[tts] Phonemizer error, retrying without punctuation...")
+                simple = re.sub(r'[^\w\s]', ' ', normalized)
+                simple = ' '.join(simple.split())
+                
+                try:
+                    wav = self.tts.infer(simple, self.ref_codes, self.ref_text)
+                    tmp = io.BytesIO()
+                    sf.write(tmp, wav, 24000, format="WAV")
+                    tmp.seek(0)
+                    audio_bytes = tmp.getvalue()
+                    del wav
+                    del tmp
+                    gc.collect()
+                    return audio_bytes
+                except:
+                    raise e
+            raise
+        except Exception as e:
+            if any(kw in str(e).lower() for kw in ['token', 'length', 'too long']):
+                raise TokenLimitError(f"Text too long: {e}")
+            raise
+
+class TokenLimitError(Exception):
+    pass
+
+def load_default_reference():
+    """Download default reference files"""
+    base = os.path.expanduser("~/.neuttsair_reference")
+    os.makedirs(base, exist_ok=True)
+    wav_path = os.path.join(base, "dave.wav")
+    txt_path = os.path.join(base, "dave.txt")
+    
+    if not os.path.exists(wav_path):
+        print("[ref] Downloading default audio...")
+        urllib.request.urlretrieve(
+            "https://raw.githubusercontent.com/neuphonic/neutts-air/main/samples/dave.wav",
+            wav_path
+        )
+    if not os.path.exists(txt_path):
+        urllib.request.urlretrieve(
+            "https://raw.githubusercontent.com/neuphonic/neutts-air/main/samples/dave.txt",
+            txt_path
+        )
+    return wav_path, txt_path
+
+# ==============================
+# GUI
+# ==============================
+class NeuTTSGui:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("NeuTTS-Air GUI - Phonemizer Fixed")
+        self.root.geometry("700x550")
+        
+        self.profile_manager = VoiceProfileManager()
+        self.current_audio = []
+        self.ref_wav, self.ref_txt = load_default_reference()
+        self.is_generating = False
+        self.tts_engine = TTSEngine.get_instance()
+        self.current_chunks = []
+        self.chunk_times = []
+        
+        self.create_widgets()
+        self.load_voice_profiles()
+        
+        # Preload model
+        threading.Thread(target=self._preload_model, daemon=True).start()
+    
+    def _preload_model(self):
+        """Preload model in background"""
+        try:
+            self.root.after(0, lambda: self.status_label.config(text="Loading model..."))
+            self.tts_engine.initialize_model()
+            self.tts_engine.load_reference(self.ref_wav, self.ref_txt)
+            self.root.after(0, lambda: self.status_label.config(text="Ready!"))
+        except Exception as e:
+            print(f"[tts] Preload failed: {e}")
+            self.root.after(0, lambda: self.status_label.config(text="Ready"))
+    
+    def create_widgets(self):
+        # Voice selection
+        profile_frame = tk.LabelFrame(self.root, text="Voice Profile", padx=10, pady=5)
+        profile_frame.pack(fill="x", padx=10, pady=5)
+        
+        tk.Label(profile_frame, text="Voice:").pack(side=tk.LEFT, padx=5)
+        self.voice_combo = ttk.Combobox(profile_frame, width=30, state="readonly")
+        self.voice_combo.pack(side=tk.LEFT, padx=5)
+        self.voice_combo.bind("<<ComboboxSelected>>", self.on_voice_selected)
+        
+        tk.Button(profile_frame, text="Load Custom", command=self.load_custom_voice).pack(side=tk.LEFT, padx=5)
+        tk.Button(profile_frame, text="Save", command=self.save_voice).pack(side=tk.LEFT, padx=5)
+        tk.Button(profile_frame, text="Delete", command=self.delete_voice).pack(side=tk.LEFT, padx=5)
+        
+        # Text input
+        text_frame = tk.LabelFrame(self.root, text="Text to Speak", padx=10, pady=5)
+        text_frame.pack(fill="both", expand=True, padx=10, pady=5)
+        
+        self.textbox = scrolledtext.ScrolledText(text_frame, wrap=tk.WORD, width=80, height=12)
+        self.textbox.pack(fill="both", expand=True)
+        self.textbox.insert("1.0", "Hello! This is the phonemizer-fixed version of NeuTTS Air. The text normalization has been improved to prevent line splitting errors.")
+        
+        # Controls
+        controls_frame = tk.LabelFrame(self.root, text="Controls", padx=10, pady=5)
+        controls_frame.pack(fill="x", padx=10, pady=5)
+        
+        buttons = tk.Frame(controls_frame)
+        buttons.pack(fill="x", pady=5)
+        
+        self.gen_btn = tk.Button(buttons, text="Generate", command=self.generate, width=20, height=2)
+        self.gen_btn.pack(side=tk.LEFT, padx=5)
+        
+        self.save_btn = tk.Button(buttons, text="Save Audio", command=self.save_audio, width=20, height=2, state="disabled")
+        self.save_btn.pack(side=tk.LEFT, padx=5)
+        
+        self.cancel_btn = tk.Button(buttons, text="Cancel", command=self.cancel, width=15, height=2, state="disabled")
+        self.cancel_btn.pack(side=tk.LEFT, padx=5)
+        
+        # Progress
+        progress = tk.Frame(controls_frame)
+        progress.pack(fill="x", pady=5)
+        
+        tk.Label(progress, text="Progress:").pack(side=tk.LEFT, padx=5)
+        self.progress_var = tk.DoubleVar()
+        self.progress_bar = ttk.Progressbar(progress, variable=self.progress_var, maximum=100)
+        self.progress_bar.pack(side=tk.LEFT, fill="x", expand=True, padx=5)
+        
+        self.progress_label = tk.Label(progress, text="0/0", width=10)
+        self.progress_label.pack(side=tk.LEFT, padx=5)
+        
+        # Status
+        self.status_label = tk.Label(self.root, text="Ready", relief=tk.SUNKEN, anchor=tk.W)
+        self.status_label.pack(side=tk.BOTTOM, fill=tk.X)
+    
+    def load_voice_profiles(self):
+        profiles = ["Default"] + self.profile_manager.list_profiles()
+        self.voice_combo['values'] = profiles
+        if profiles:
+            self.voice_combo.current(0)
+    
+    def on_voice_selected(self, event=None):
+        selected = self.voice_combo.get()
+        if selected == "Default":
+            self.ref_wav, self.ref_txt = load_default_reference()
+        else:
+            profile = self.profile_manager.get_profile(selected)
+            if profile:
+                self.ref_wav, self.ref_txt = profile
+        threading.Thread(target=self._reload_ref, daemon=True).start()
+    
+    def _reload_ref(self):
+        try:
+            self.tts_engine.load_reference(self.ref_wav, self.ref_txt)
+        except Exception as e:
+            print(f"[tts] Reload failed: {e}")
+    
+    def load_custom_voice(self):
+        wav = filedialog.askopenfilename(title="Select Audio", filetypes=[("WAV", "*.wav")])
+        if not wav:
+            return
+        txt = filedialog.askopenfilename(title="Select Text", filetypes=[("Text", "*.txt")])
+        if not txt:
+            return
+        
+        self.ref_wav = wav
+        self.ref_txt = txt
+        self.status_label.config(text="Custom voice loaded")
+        threading.Thread(target=self._reload_ref, daemon=True).start()
+    
+    def save_voice(self):
+        if not self.ref_wav or not self.ref_txt:
+            messagebox.showwarning("No Voice", "Load a voice first")
+            return
+        
+        name = tk.simpledialog.askstring("Save Voice", "Voice name:")
+        if name and self.profile_manager.add_profile(name, self.ref_wav, self.ref_txt):
+            self.load_voice_profiles()
+            self.voice_combo.set(name)
+            self.status_label.config(text=f"Saved: {name}")
+    
+    def delete_voice(self):
+        selected = self.voice_combo.get()
+        if selected == "Default":
+            messagebox.showinfo("Info", "Cannot delete default")
+            return
+        
+        if messagebox.askyesno("Delete", f"Delete '{selected}'?"):
+            if self.profile_manager.delete_profile(selected):
+                self.load_voice_profiles()
+                self.voice_combo.current(0)
+    
+    def _split_chunks(self, text: str, max_chars: int = 250) -> List[str]:
+        """Split text into manageable chunks"""
+        chunks = []
+        pos = 0
+        length = len(text)
+        
+        while pos < length:
+            end = min(pos + max_chars, length)
+            
+            if end == length:
+                chunk = text[pos:].strip()
+                if chunk:
+                    chunks.append(chunk)
+                break
+            
+            chunk_text = text[pos:end]
+            
+            # Find sentence end
+            endings = [m.end() for m in re.finditer(r'[.!?]\s', chunk_text)]
+            if endings:
+                actual_end = pos + endings[-1]
+                chunk = text[pos:actual_end].strip()
+                if chunk:
+                    chunks.append(chunk)
+                pos = actual_end
+            else:
+                # Find comma/semicolon
+                breaks = [m.end() for m in re.finditer(r'[,;:]\s', chunk_text)]
+                if breaks:
+                    actual_end = pos + breaks[-1]
+                    chunk = text[pos:actual_end].strip()
+                    if chunk:
+                        chunks.append(chunk)
+                    pos = actual_end
+                else:
+                    # Word boundary
+                    words = chunk_text.split()
+                    if len(words) > 1:
+                        safe = ' '.join(words[:-1])
+                        actual_end = pos + len(safe)
+                        chunk = text[pos:actual_end].strip()
+                        if chunk:
+                            chunks.append(chunk)
+                        pos = actual_end
+                    else:
+                        chunk = chunk_text.strip()
+                        if chunk:
+                            chunks.append(chunk)
+                        pos = end
+        
+        return chunks
+    
+    def generate(self):
+        if self.is_generating:
+            return
+        
+        text = self.textbox.get("1.0", tk.END).strip()
+        if not text:
+            messagebox.showwarning("No Text", "Enter text first")
+            return
+        
+        self.current_chunks = self._split_chunks(text)
+        if not self.current_chunks:
+            return
+        
+        self.is_generating = True
+        self.current_audio = []
+        self.chunk_times = []
+        
+        self.gen_btn.config(state="disabled")
+        self.cancel_btn.config(state="normal")
+        self.save_btn.config(state="disabled")
+        self.progress_var.set(0)
+        self.progress_label.config(text=f"0/{len(self.current_chunks)}")
+        
+        threading.Thread(target=self._generate_thread, daemon=True).start()
+    
+    def _generate_thread(self):
+        try:
+            self.tts_engine.initialize_model()
+            self.tts_engine.load_reference(self.ref_wav, self.ref_txt)
+            
+            total = len(self.current_chunks)
+            
+            for i, chunk in enumerate(self.current_chunks):
+                if not self.is_generating:
+                    break
+                
+                self.root.after(0, lambda idx=i: self.status_label.config(text=f"Processing {idx+1}/{total}..."))
+                
+                start = time.time()
+                audio = self.tts_engine.synthesize(chunk)
+                elapsed = time.time() - start
+                
+                if audio:
+                    self.current_audio.append(audio)
+                    self.chunk_times.append(elapsed)
+                    
+                    progress = ((i + 1) / total) * 100
+                    self.root.after(0, lambda p=progress: self.progress_var.set(p))
+                    self.root.after(0, lambda idx=i+1, t=total: 
+                                  self.progress_label.config(text=f"{idx}/{t}"))
+                    
+                    if len(self.current_audio) == 1:
+                        self.root.after(0, lambda: self.save_btn.config(state="normal"))
+            
+            if self.is_generating and self.current_audio:
+                avg_time = statistics.mean(self.chunk_times)
+                self.root.after(0, lambda: self.status_label.config(
+                    text=f"Complete! {len(self.current_audio)} chunks ({avg_time:.1f}s avg)"))
+            
+        except Exception as e:
+            traceback.print_exc()
+            self.root.after(0, lambda: messagebox.showerror("Error", str(e)))
+            self.root.after(0, lambda: self.status_label.config(text=f"Error: {e}"))
+        finally:
+            self.is_generating = False
+            self.root.after(0, lambda: self.gen_btn.config(state="normal"))
+            self.root.after(0, lambda: self.cancel_btn.config(state="disabled"))
+    
+    def cancel(self):
+        self.is_generating = False
+        self.status_label.config(text="Cancelled")
+    
+    def save_audio(self):
+        if not self.current_audio:
+            messagebox.showwarning("No Audio", "Generate audio first")
+            return
+        
+        try:
+            import soundfile as sf
+            
+            # Combine chunks
+            all_audio = []
+            for chunk_bytes in self.current_audio:
+                data, sr = sf.read(io.BytesIO(chunk_bytes))
+                all_audio.append(data)
+            
+            combined = np.concatenate(all_audio)
+            
+            filename = filedialog.asksaveasfilename(
+                defaultextension=".wav",
+                filetypes=[("WAV", "*.wav")],
+                initialfile=f"speech_{datetime.now().strftime('%Y%m%d_%H%M%S')}.wav"
+            )
+            
+            if filename:
+                sf.write(filename, combined, 24000)
+                self.status_label.config(text=f"Saved: {os.path.basename(filename)}")
+                messagebox.showinfo("Success", "Audio saved!")
+        except Exception as e:
+            traceback.print_exc()
+            messagebox.showerror("Error", f"Save failed: {e}")
+
+# ==============================
+# Main
+# ==============================
+def main():
+    print("NeuTTS-Air GUI - Phonemizer Fixed")
+    print(f"Platform: {platform.system()} {platform.machine()}")
+    print(f"Python: {sys.version}")
+    
+    # Import simpledialog
+    try:
+        import tkinter.simpledialog
+    except ImportError:
+        import tkinter.simpledialog as simpledialog
+        tk.simpledialog = simpledialog
+    
+    set_phonemizer_env()
+    
+    try:
+        ensure_all_dependencies()
+    except Exception as e:
+        print(f"[error] Dependencies failed: {e}")
+    
+    set_phonemizer_env()
+    root = tk.Tk()
+    app = NeuTTSGui(root)
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
