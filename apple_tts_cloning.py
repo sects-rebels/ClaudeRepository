@@ -492,7 +492,7 @@ class TTSEngine:
             TTSEngine._instance = TTSEngine()
         return TTSEngine._instance
     
-    def initialize_model(self, force_cpu=False):
+    def initialize_model(self, force_cpu=False, retry_count=3):
         """Load the TTS model once"""
         if self.tts is not None:
             return  # Already loaded
@@ -510,40 +510,77 @@ class TTSEngine:
         except ImportError:
             print("[tts] llama-cpp-python not available, will use PyTorch backend")
 
+        # Try GGUF backend first (recommended)
         if gguf_available:
-            try:
-                # GGUF uses CPU for backbone, but can use GPU for codec
-                codec_device = "cpu" if force_cpu else device
-                self.tts = NeuTTSAir(
-                    backbone_repo="neuphonic/neutts-air-q4-gguf",
-                    backbone_device="cpu",  # GGUF backbone always on CPU
-                    codec_repo="neuphonic/neucodec",
-                    codec_device=codec_device,  # Codec can use GPU for massive speedup
-                )
-                print(f"[tts] Using GGUF backend (backbone: cpu, codec: {codec_device})")
-            except Exception as _gguf_err:
-                print(f"[tts] GGUF load failed ({_gguf_err}). Attempting PyTorch fallback …")
-                gguf_available = False
+            for attempt in range(retry_count):
+                try:
+                    # GGUF uses CPU for backbone, but can use GPU for codec
+                    codec_device = "cpu" if force_cpu else device
+                    self.tts = NeuTTSAir(
+                        backbone_repo="neuphonic/neutts-air-q4-gguf",
+                        backbone_device="cpu",  # GGUF backbone always on CPU
+                        codec_repo="neuphonic/neucodec",
+                        codec_device=codec_device,  # Codec can use GPU for massive speedup
+                    )
+                    print(f"[tts] Using GGUF backend (backbone: cpu, codec: {codec_device})")
+                    print("[tts] Model loaded and ready!")
+                    return
+                except Exception as _gguf_err:
+                    if attempt < retry_count - 1:
+                        print(f"[tts] GGUF load attempt {attempt + 1} failed: {_gguf_err}")
+                        print(f"[tts] Retrying in 2 seconds...")
+                        time.sleep(2)
+                    else:
+                        print(f"[tts] GGUF load failed after {retry_count} attempts: {_gguf_err}")
+                        print("[tts] Attempting PyTorch fallback...")
+                        gguf_available = False
 
+        # PyTorch fallback (if GGUF failed or not available)
         if not gguf_available:
             try:
                 ensure_dependency("torch", "torch")
                 ensure_dependency("transformers", "transformers")
             except Exception as e:
-                print(f"[deps] Could not provision torch/transformers for PT fallback: {e}")
-                raise
+                raise Exception(
+                    f"Failed to install PyTorch/transformers for fallback: {e}\n"
+                    f"SOLUTION:\n"
+                    f"1. Check your internet connection\n"
+                    f"2. Manually install: pip install torch transformers\n"
+                    f"3. If on macOS: pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cpu"
+                )
 
-            from neuttsair.neutts import NeuTTSAir as _NeuPT
-            # PyTorch can use GPU for both
-            self.tts = _NeuPT(
-                backbone_repo="neuphonic/neutts-air",
-                backbone_device=device,
-                codec_repo="neuphonic/neucodec",
-                codec_device=device,
-            )
-            print(f"[tts] Using PyTorch backend (device: {device})")
-
-        print("[tts] Model loaded and ready!")
+            for attempt in range(retry_count):
+                try:
+                    from neuttsair.neutts import NeuTTSAir as _NeuPT
+                    # PyTorch can use GPU for both
+                    self.tts = _NeuPT(
+                        backbone_repo="neuphonic/neutts-air",
+                        backbone_device=device,
+                        codec_repo="neuphonic/neucodec",
+                        codec_device=device,
+                    )
+                    print(f"[tts] Using PyTorch backend (device: {device})")
+                    print("[tts] Model loaded and ready!")
+                    return
+                except Exception as pt_err:
+                    if attempt < retry_count - 1:
+                        print(f"[tts] PyTorch load attempt {attempt + 1} failed: {pt_err}")
+                        print(f"[tts] Retrying in 2 seconds...")
+                        time.sleep(2)
+                    else:
+                        # Final failure - provide helpful error message
+                        error_msg = (
+                            f"Failed to load PyTorch backend after {retry_count} attempts.\n\n"
+                            f"Original error: {pt_err}\n\n"
+                            f"TROUBLESHOOTING:\n"
+                            f"1. Check internet connection (needed to download models from HuggingFace)\n"
+                            f"2. Clear HuggingFace cache: rm -rf ~/.cache/huggingface/\n"
+                            f"3. Update transformers: pip install --upgrade transformers huggingface_hub\n"
+                            f"4. Try again in a few minutes (HuggingFace API may be temporarily down)\n"
+                            f"5. Check HuggingFace status: https://status.huggingface.co/\n\n"
+                            f"If issue persists, the model files may need to be downloaded manually."
+                        )
+                        raise Exception(error_msg)
     
     def load_reference(self, ref_wav: str, ref_txt: str):
         """Load and encode reference voice (cached)"""
@@ -725,8 +762,30 @@ class NeuTTSGui:
             self.tts_engine.load_reference(self.ref_wav, self.ref_txt)
             self.root.after(0, lambda: self.status_label.config(text="Ready - Model loaded!"))
         except Exception as e:
+            error_str = str(e)
             print(f"[tts] Preload failed: {e}")
-            self.root.after(0, lambda: self.status_label.config(text="Ready"))
+            traceback.print_exc()
+
+            # Provide user-friendly error message
+            if "NoneType" in error_str or "HuggingFace" in error_str or "API" in error_str:
+                msg = (
+                    "Failed to download model from HuggingFace.\n\n"
+                    "This is usually caused by:\n"
+                    "1. Internet connection issues\n"
+                    "2. HuggingFace API being temporarily down\n"
+                    "3. Firewall blocking downloads\n\n"
+                    "SOLUTIONS:\n"
+                    "• Check your internet connection\n"
+                    "• Wait a few minutes and restart the app\n"
+                    "• Check HuggingFace status: status.huggingface.co\n"
+                    "• Clear cache: rm -rf ~/.cache/huggingface/\n\n"
+                    "You can still use the app - it will try to load the model when you click Generate."
+                )
+            else:
+                msg = f"Model preload failed: {error_str}\n\nYou can still use the app - it will try to load when you click Generate."
+
+            self.root.after(0, lambda m=msg: messagebox.showwarning("Model Load Warning", m))
+            self.root.after(0, lambda: self.status_label.config(text="Ready (model not preloaded)"))
         
     def create_widgets(self):
         # Top frame - Voice Profile Selection
