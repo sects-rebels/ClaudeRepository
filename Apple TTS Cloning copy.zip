@@ -546,7 +546,7 @@ class OptimizedTTSEngine:
     def __init__(self):
         if OptimizedTTSEngine._instance is not None:
             raise Exception("Use OptimizedTTSEngine.get_instance()")
-        
+
         self.tts = None
         self.current_ref_wav = None
         self.current_ref_txt = None
@@ -555,7 +555,9 @@ class OptimizedTTSEngine:
         self.device = get_best_device()
         self.use_streaming = False  # Can enable for faster first-byte
         self.use_onnx_codec = False
-        
+        self.backend_type = None  # Track which backend is loaded ('gguf' or 'pytorch')
+        self.gguf_failed = False  # Track if GGUF had runtime failures
+
         # Thread pool for parallel processing
         self.executor = ThreadPoolExecutor(max_workers=min(4, multiprocessing.cpu_count()))
         
@@ -586,22 +588,25 @@ class OptimizedTTSEngine:
         except ImportError:
             print("[tts] llama-cpp-python not available, will use PyTorch backend")
         
-        if gguf_available:
+        if gguf_available and not self.gguf_failed:
             try:
                 # Use Q4 quantization for best speed/quality tradeoff
+                # Increase context size to 8192 to handle longer texts (default is 2048)
                 self.tts = NeuTTSAir(
                     backbone_repo="neuphonic/neutts-air-q4-gguf",
                     backbone_device=self.device if self.device == "cpu" else "cpu",  # GGUF runs on CPU
                     codec_repo=codec_repo,
                     codec_device=self.device,
+                    n_ctx=8192,  # Increase context size to prevent overflow
                 )
                 print(f"[tts] Using GGUF Q4 backend (fastest)")
-                
+                self.backend_type = 'gguf'
+
                 # Set optimal number of threads for llama.cpp
                 if hasattr(self.tts, 'llama') and hasattr(self.tts.llama, 'n_threads'):
                     self.tts.llama.n_threads = min(8, multiprocessing.cpu_count())
                     print(f"[tts] Set llama.cpp threads to {self.tts.llama.n_threads}")
-                    
+
             except Exception as _gguf_err:
                 print(f"[tts] GGUF load failed ({_gguf_err}). Attempting PyTorch fallback …")
                 gguf_available = False
@@ -629,6 +634,7 @@ class OptimizedTTSEngine:
                 codec_device=self.device,
             )
             print(f"[tts] Using PyTorch backend on {self.device}")
+            self.backend_type = 'pytorch'
             
             # Try to compile model for faster inference (PyTorch 2.0+)
             try:
@@ -644,6 +650,64 @@ class OptimizedTTSEngine:
         # Apply phonemizer fix for macOS line mismatch issues
         if sys.platform.startswith("darwin"):
             fix_phonemizer_macos(self.tts)
+
+    def reinitialize_with_pytorch(self):
+        """Reinitialize the TTS engine with PyTorch backend (fallback from GGUF)"""
+        print("[tts] Reinitializing with PyTorch backend due to GGUF runtime errors...")
+
+        # Clear existing model
+        self.tts = None
+        self.backend_type = None
+        self.gguf_failed = True  # Prevent GGUF from being used again
+
+        # Force PyTorch initialization
+        try:
+            ensure_dependency("torch", "torch")
+            ensure_dependency("transformers", "transformers")
+
+            # Enable torch optimizations
+            import torch
+            torch.set_num_threads(min(8, multiprocessing.cpu_count()))
+            if hasattr(torch, 'compile'):
+                torch._dynamo.config.suppress_errors = True
+
+        except Exception as e:
+            print(f"[deps] Could not provision torch/transformers: {e}")
+            raise
+
+        from neuttsair.neutts import NeuTTSAir
+        codec_repo = "neuphonic/neucodec"
+
+        self.tts = NeuTTSAir(
+            backbone_repo="neuphonic/neutts-air",
+            backbone_device=self.device,
+            codec_repo=codec_repo,
+            codec_device=self.device,
+        )
+        print(f"[tts] Using PyTorch backend on {self.device}")
+        self.backend_type = 'pytorch'
+
+        # Try to compile model for faster inference (PyTorch 2.0+)
+        try:
+            import torch
+            if hasattr(torch, 'compile') and self.device != "mps":  # MPS doesn't support compile yet
+                self.tts.model = torch.compile(self.tts.model, mode="reduce-overhead")
+                print("[tts] Model compiled with torch.compile for faster inference")
+        except Exception as e:
+            print(f"[tts] Could not compile model: {e}")
+
+        # Apply phonemizer fix for macOS line mismatch issues
+        if sys.platform.startswith("darwin"):
+            fix_phonemizer_macos(self.tts)
+
+        # Re-encode reference if we had one
+        if self.current_ref_wav and self.current_ref_txt:
+            print("[tts] Re-encoding reference with new backend...")
+            ref_wav = self.current_ref_wav
+            ref_txt = self.current_ref_txt
+            self.current_ref_wav = None  # Clear to force re-encoding
+            self.current_ref_txt = None
+            self.load_reference(ref_wav, ref_txt)
 
     def load_reference(self, ref_wav: str, ref_txt: str):
         """Load and encode reference voice (cached)"""
@@ -711,26 +775,42 @@ class OptimizedTTSEngine:
         
         try:
             wav = self.tts.infer(normalized_text, self.ref_codes, self.ref_text)
-            
+
             # Convert to bytes
             tmp = io.BytesIO()
             sf.write(tmp, wav, 24000, format="WAV")
             tmp.seek(0)
             audio_bytes = tmp.getvalue()
-            
+
             # Explicit cleanup to prevent memory buildup
             del wav
             del tmp
-            
+
             # Only do GC if needed to reduce overhead
             if len(text) > 200:  # Larger chunks need more memory
                 gc.collect()
-            
+
             return audio_bytes
         except Exception as e:
             error_str = str(e).lower()
+
+            # Check for llama_decode errors (GGUF backend issues)
+            if 'llama_decode' in error_str or 'llama.cpp' in error_str:
+                if self.backend_type == 'gguf':
+                    print(f"[tts] GGUF backend error: {e}")
+                    print("[tts] Falling back to PyTorch backend...")
+                    try:
+                        self.reinitialize_with_pytorch()
+                        # Retry synthesis with PyTorch
+                        return self.synthesize(text)
+                    except Exception as fallback_error:
+                        print(f"[tts] PyTorch fallback also failed: {fallback_error}")
+                        raise RuntimeError(f"Both GGUF and PyTorch backends failed: {e} | {fallback_error}")
+                else:
+                    raise
+
             # Check if it's a token limit error
-            if any(keyword in error_str for keyword in ['token', 'length', 'too long', 'maximum', 'context']):
+            elif any(keyword in error_str for keyword in ['token', 'length', 'too long', 'maximum', 'context']):
                 print(f"[tts] Token limit exceeded, text too long")
                 raise TokenLimitError(f"Text too long for model: {e}")
             else:
