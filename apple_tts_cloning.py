@@ -586,15 +586,29 @@ class TTSEngine:
         """Load and encode reference voice (cached)"""
         if self.tts is None:
             self.initialize_model()
-        
+
         # Only re-encode if reference changed
         if ref_wav != self.current_ref_wav or ref_txt != self.current_ref_txt:
             print(f"[tts] Encoding reference voice...")
             self.ref_text = open(ref_txt, "r", encoding="utf-8").read().strip()
+
+            # CRITICAL: Truncate reference text if too long
+            # Model has 2048 token context window, reference should use max ~500 tokens (~250 chars)
+            if len(self.ref_text) > 250:
+                print(f"[tts] WARNING: Reference text too long ({len(self.ref_text)} chars), truncating to 250 chars")
+                # Find last complete sentence within 250 chars
+                truncated = self.ref_text[:250]
+                last_period = truncated.rfind('.')
+                if last_period > 100:  # Keep at least 100 chars
+                    self.ref_text = truncated[:last_period + 1].strip()
+                else:
+                    self.ref_text = truncated.strip()
+                print(f"[tts] Reference text truncated to: '{self.ref_text[:50]}...'")
+
             self.ref_codes = self.tts.encode_reference(ref_wav)
             self.current_ref_wav = ref_wav
             self.current_ref_txt = ref_txt
-            print(f"[tts] Reference voice ready")
+            print(f"[tts] Reference voice ready (text length: {len(self.ref_text)} chars)")
     
     def synthesize(self, text: str, skip_gc=False) -> Optional[bytes]:
         """Synthesize text using cached model and reference - THREAD-SAFE"""
@@ -808,7 +822,8 @@ class NeuTTSGui:
         
         self.textbox = scrolledtext.ScrolledText(text_frame, wrap=tk.WORD, width=80, height=12)
         self.textbox.pack(fill="both", expand=True)
-        self.textbox.insert("1.0", "Welcome to NeuTTS-Air! Type or paste any text here and click 'Generate Audio' to create speech.\n\nThe text will be processed in 300-character chunks, with each chunk ending at the last complete sentence before the 300-character limit. This ensures natural breaks in the audio while keeping chunks manageable for the model.")
+        # SHORT default text to avoid token limit issues
+        self.textbox.insert("1.0", "Hello! Welcome to NeuTTS-Air. This is a test of the text-to-speech system.")
         
         # Control buttons frame
         controls_frame = tk.LabelFrame(self.root, text="Controls", padx=10, pady=5)
@@ -932,7 +947,7 @@ class NeuTTSGui:
                 self.voice_combo.current(0)
                 self.status_label.config(text=f"Deleted voice: {selected}")
     
-    def _split_into_sentence_chunks(self, text: str, max_chars: int = 300) -> List[str]:
+    def _split_into_sentence_chunks(self, text: str, max_chars: int = 150) -> List[str]:
         """Split text into chunks of up to max_chars, ending at sentence boundaries"""
         chunks = []
         current_pos = 0
@@ -1054,8 +1069,9 @@ class NeuTTSGui:
             start_index = len(self.completed_chunk_indices)
             print(f"[tts] Resuming from chunk {start_index}/{len(chunks)}")
         else:
-            # Split text into 300-character chunks ending at sentences
-            chunks = self._split_into_sentence_chunks(text, max_chars=300)
+            # Split text into 150-character chunks ending at sentences
+            # (reduced from 300 to avoid token limit with reference text)
+            chunks = self._split_into_sentence_chunks(text, max_chars=150)
             self.current_chunks = chunks
             self.completed_chunk_indices = []
             self.current_audio_sequence = []
@@ -1065,7 +1081,7 @@ class NeuTTSGui:
                 messagebox.showwarning("No Text", "Could not parse any text.")
                 return
             
-            print(f"[tts] Split into {len(chunks)} chunks (max 300 chars each)")
+            print(f"[tts] Split into {len(chunks)} chunks (max 150 chars each)")
         
         self.is_generating = True
         self.chunk_times = []
