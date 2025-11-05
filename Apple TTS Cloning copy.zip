@@ -644,14 +644,51 @@ class OptimizedTTSEngine:
                 raise
 
             from neuttsair.neutts import NeuTTSAir as _NeuPT
-            self.tts = _NeuPT(
-                backbone_repo="neuphonic/neutts-air",
-                backbone_device=self.device,
-                codec_repo=codec_repo,
-                codec_device=self.device,
-            )
-            print(f"[tts] Using PyTorch backend on {self.device} (recommended for voice cloning)")
-            self.backend_type = 'pytorch'
+            try:
+                self.tts = _NeuPT(
+                    backbone_repo="neuphonic/neutts-air",
+                    backbone_device=self.device,
+                    codec_repo=codec_repo,
+                    codec_device=self.device,
+                )
+                print(f"[tts] Using PyTorch backend on {self.device} (recommended for voice cloning)")
+                self.backend_type = 'pytorch'
+            except (AttributeError, RuntimeError) as model_error:
+                # Handle transformers model loading errors
+                error_msg = str(model_error)
+                if "'NoneType' object has no attribute 'get'" in error_msg or "metadata" in error_msg:
+                    print(f"[tts] PyTorch model loading failed (HuggingFace API issue): {model_error}")
+                    print(f"[tts] Trying alternative loading method...")
+                    try:
+                        # Try with trust_remote_code and force download
+                        import transformers
+                        # Clear HuggingFace cache for this model
+                        import os
+                        cache_dir = os.path.expanduser("~/.cache/huggingface/hub")
+                        print(f"[tts] Note: If issues persist, try clearing cache: rm -rf {cache_dir}/models--neuphonic--neutts-air")
+
+                        # Retry with explicit cache handling
+                        self.tts = _NeuPT(
+                            backbone_repo="neuphonic/neutts-air",
+                            backbone_device="cpu",  # Try CPU first, then move to device
+                            codec_repo=codec_repo,
+                            codec_device=self.device,
+                        )
+                        # Move backbone to target device if not CPU
+                        if self.device != "cpu" and hasattr(self.tts, 'backbone'):
+                            import torch
+                            self.tts.backbone = self.tts.backbone.to(self.device)
+                        print(f"[tts] Using PyTorch backend on {self.device} (alternative method)")
+                        self.backend_type = 'pytorch'
+                    except Exception as retry_error:
+                        print(f"[tts] Alternative loading also failed: {retry_error}")
+                        raise RuntimeError(
+                            f"Failed to load PyTorch backend. This may be a HuggingFace API issue.\n"
+                            f"Try: 1) Check internet connection, 2) Clear HF cache, 3) Update transformers: pip install --upgrade transformers\n"
+                            f"Original error: {model_error}"
+                        )
+                else:
+                    raise
             
             # Try to compile model for faster inference (PyTorch 2.0+)
             try:
@@ -695,14 +732,34 @@ class OptimizedTTSEngine:
         from neuttsair.neutts import NeuTTSAir
         codec_repo = "neuphonic/neucodec"
 
-        self.tts = NeuTTSAir(
-            backbone_repo="neuphonic/neutts-air",
-            backbone_device=self.device,
-            codec_repo=codec_repo,
-            codec_device=self.device,
-        )
-        print(f"[tts] Using PyTorch backend on {self.device}")
-        self.backend_type = 'pytorch'
+        try:
+            self.tts = NeuTTSAir(
+                backbone_repo="neuphonic/neutts-air",
+                backbone_device=self.device,
+                codec_repo=codec_repo,
+                codec_device=self.device,
+            )
+            print(f"[tts] Using PyTorch backend on {self.device}")
+            self.backend_type = 'pytorch'
+        except (AttributeError, RuntimeError) as model_error:
+            error_msg = str(model_error)
+            if "'NoneType' object has no attribute 'get'" in error_msg or "metadata" in error_msg:
+                print(f"[tts] PyTorch model loading failed: {model_error}")
+                print(f"[tts] Trying alternative loading method...")
+                # Try loading on CPU first then moving to device
+                self.tts = NeuTTSAir(
+                    backbone_repo="neuphonic/neutts-air",
+                    backbone_device="cpu",
+                    codec_repo=codec_repo,
+                    codec_device=self.device,
+                )
+                if self.device != "cpu" and hasattr(self.tts, 'backbone'):
+                    import torch
+                    self.tts.backbone = self.tts.backbone.to(self.device)
+                print(f"[tts] Using PyTorch backend on {self.device} (alternative method)")
+                self.backend_type = 'pytorch'
+            else:
+                raise
 
         # Try to compile model for faster inference (PyTorch 2.0+)
         try:
