@@ -1035,8 +1035,30 @@ class OptimizedNeuTTSGui:
             self.root.after(0, lambda: self.status_label.config(
                 text=f"Ready - Model loaded on {self.tts_engine.device}!"))
         except Exception as e:
+            error_str = str(e)
             print(f"[tts] Preload failed: {e}")
-            self.root.after(0, lambda: self.status_label.config(text="Ready"))
+            traceback.print_exc()
+
+            # Provide user-friendly error message
+            if "NoneType" in error_str or "HuggingFace" in error_str or "API" in error_str:
+                msg = (
+                    "Failed to download model from HuggingFace.\n\n"
+                    "This is usually caused by:\n"
+                    "1. Internet connection issues\n"
+                    "2. HuggingFace API being temporarily down\n"
+                    "3. Firewall blocking downloads\n\n"
+                    "SOLUTIONS:\n"
+                    "• Check your internet connection\n"
+                    "• Wait a few minutes and restart the app\n"
+                    "• Check HuggingFace status: status.huggingface.co\n"
+                    "• Clear cache: rm -rf ~/.cache/huggingface/\n\n"
+                    "You can still use the app - it will try to load the model when you click Generate."
+                )
+            else:
+                msg = f"Model preload failed: {error_str}\n\nYou can still use the app - it will try to load when you click Generate."
+
+            self.root.after(0, lambda m=msg: messagebox.showwarning("Model Load Warning", m))
+            self.root.after(0, lambda: self.status_label.config(text="Ready (model not preloaded)"))
         
     def create_widgets(self):
         # Top frame - Voice Profile Selection
