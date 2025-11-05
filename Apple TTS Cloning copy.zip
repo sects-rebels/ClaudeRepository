@@ -223,6 +223,61 @@ def ensure_espeak_installed():
                 print("On Windows, install eSpeak NG from: https://github.com/espeak-ng/espeak-ng/releases")
     set_phonemizer_env()
 
+def fix_phonemizer_macos(tts_instance):
+    """
+    Fix phonemizer line mismatch issues on macOS.
+    The espeak backend sometimes adds extra newlines, causing input/output line count mismatches.
+    This patches the phonemizer to handle this gracefully.
+    """
+    try:
+        if not hasattr(tts_instance, 'phonemizer'):
+            return
+
+        phonemizer = tts_instance.phonemizer
+
+        # Monkey-patch the _phonemize_postprocess method to strip and normalize output
+        if hasattr(phonemizer, '_phonemize_postprocess'):
+            original_postprocess = phonemizer._phonemize_postprocess
+
+            def patched_postprocess(phonemized, punctuation_marks, separator, strip):
+                """Patched version that normalizes line endings before checking"""
+                # Strip and normalize the phonemized output to avoid line count issues
+                if isinstance(phonemized, list):
+                    # Remove empty lines and strip each line
+                    phonemized = [line.strip() for line in phonemized if line.strip()]
+                    # If we have multiple lines but expect one, join them
+                    if len(phonemized) > 1:
+                        phonemized = [' '.join(phonemized)]
+
+                try:
+                    return original_postprocess(phonemized, punctuation_marks, separator, strip)
+                except RuntimeError as e:
+                    if "number of lines in input and output must be equal" in str(e):
+                        # If still failing, just return the joined phonemized output
+                        if isinstance(phonemized, list):
+                            result = separator.phone.join(phonemized) if hasattr(separator, 'phone') else ' '.join(phonemized)
+                        else:
+                            result = phonemized
+                        return [result] if isinstance(phonemized, list) else result
+                    raise
+
+            phonemizer._phonemize_postprocess = patched_postprocess
+            print("[phonemizer] Applied macOS line-mismatch fix")
+
+        # Also try to disable words_mismatch checking if available
+        if hasattr(phonemizer, '_words_mismatch') and phonemizer._words_mismatch is not None:
+            # Replace the process method with a no-op that just returns the input
+            original_process = phonemizer._words_mismatch.process
+            def passthrough_process(text):
+                """Bypass words mismatch checking"""
+                return text
+            phonemizer._words_mismatch.process = passthrough_process
+            print("[phonemizer] Disabled strict words mismatch checking")
+
+    except Exception as e:
+        print(f"[phonemizer] Warning: Could not apply macOS fix: {e}")
+        # Non-fatal, continue anyway
+
 # ==============================
 # macOS C++ compilation fix
 # ==============================
@@ -583,9 +638,13 @@ class OptimizedTTSEngine:
                     print("[tts] Model compiled with torch.compile for faster inference")
             except Exception as e:
                 print(f"[tts] Could not compile model: {e}")
-        
+
         print("[tts] Model loaded and optimized!")
-    
+
+        # Apply phonemizer fix for macOS line mismatch issues
+        if sys.platform.startswith("darwin"):
+            fix_phonemizer_macos(self.tts)
+
     def load_reference(self, ref_wav: str, ref_txt: str):
         """Load and encode reference voice (cached)"""
         if self.tts is None:
