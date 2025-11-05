@@ -581,13 +581,20 @@ class OptimizedTTSEngine:
         self.use_onnx_codec = False
         print("[tts] Using regular codec (supports both encoding and decoding)")
         
+        # IMPORTANT: GGUF backend has context size limitations (2048 tokens)
+        # that cannot be changed after model initialization. For voice cloning
+        # with custom references, PyTorch backend is more reliable.
+        # Set use_gguf_backend = True to try GGUF (faster but limited context)
+        use_gguf_backend = False  # Disabled by default due to context limitations
+
         gguf_available = False
-        try:
-            import llama_cpp
-            gguf_available = True
-        except ImportError:
-            print("[tts] llama-cpp-python not available, will use PyTorch backend")
-        
+        if use_gguf_backend and not self.gguf_failed:
+            try:
+                import llama_cpp
+                gguf_available = True
+            except ImportError:
+                print("[tts] llama-cpp-python not available, will use PyTorch backend")
+
         if gguf_available and not self.gguf_failed:
             try:
                 # Use Q4 quantization for best speed/quality tradeoff
@@ -597,15 +604,25 @@ class OptimizedTTSEngine:
                     backbone_device=self.device if self.device == "cpu" else "cpu",  # GGUF runs on CPU
                     codec_repo=codec_repo,
                     codec_device=self.device,
-                    n_ctx=8192,  # Increase context size to prevent overflow
                 )
                 print(f"[tts] Using GGUF Q4 backend (fastest)")
                 self.backend_type = 'gguf'
 
-                # Set optimal number of threads for llama.cpp
-                if hasattr(self.tts, 'llama') and hasattr(self.tts.llama, 'n_threads'):
-                    self.tts.llama.n_threads = min(8, multiprocessing.cpu_count())
-                    print(f"[tts] Set llama.cpp threads to {self.tts.llama.n_threads}")
+                # Configure llama.cpp threads after initialization
+                if hasattr(self.tts, 'llama') and self.tts.llama is not None:
+                    # Set optimal number of threads
+                    if hasattr(self.tts.llama, 'n_threads'):
+                        self.tts.llama.n_threads = min(8, multiprocessing.cpu_count())
+                        print(f"[tts] Set llama.cpp threads to {self.tts.llama.n_threads}")
+
+                    # Log context size (cannot be changed after model load)
+                    try:
+                        if hasattr(self.tts.llama, 'n_ctx'):
+                            ctx_size = self.tts.llama.n_ctx()
+                            print(f"[tts] GGUF context window: {ctx_size} tokens")
+                            print(f"[tts] Warning: Limited context may cause errors with long reference texts")
+                    except Exception:
+                        pass
 
             except Exception as _gguf_err:
                 print(f"[tts] GGUF load failed ({_gguf_err}). Attempting PyTorch fallback …")
@@ -615,17 +632,17 @@ class OptimizedTTSEngine:
             try:
                 ensure_dependency("torch", "torch")
                 ensure_dependency("transformers", "transformers")
-                
+
                 # Enable torch optimizations
                 import torch
                 torch.set_num_threads(min(8, multiprocessing.cpu_count()))
                 if hasattr(torch, 'compile'):
                     torch._dynamo.config.suppress_errors = True
-                    
+
             except Exception as e:
                 print(f"[deps] Could not provision torch/transformers for PT fallback: {e}")
                 raise
-            
+
             from neuttsair.neutts import NeuTTSAir as _NeuPT
             self.tts = _NeuPT(
                 backbone_repo="neuphonic/neutts-air",
@@ -633,7 +650,7 @@ class OptimizedTTSEngine:
                 codec_repo=codec_repo,
                 codec_device=self.device,
             )
-            print(f"[tts] Using PyTorch backend on {self.device}")
+            print(f"[tts] Using PyTorch backend on {self.device} (recommended for voice cloning)")
             self.backend_type = 'pytorch'
             
             # Try to compile model for faster inference (PyTorch 2.0+)
