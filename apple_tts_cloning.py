@@ -1312,30 +1312,36 @@ class NeuTTSGui:
         if not self.current_audio_sequence:
             messagebox.showwarning("No Audio", "No audio has been generated yet.")
             return
-        
+
         try:
             import soundfile as sf
             import numpy as np
-            
+
             # Combine all chunks into a single audio file
             all_audio_data = []
-            for chunk_bytes in self.current_audio_sequence:
+            for item in self.current_audio_sequence:
+                # Handle both tuple format (index, audio_bytes) and plain bytes
+                if isinstance(item, tuple):
+                    chunk_bytes = item[1]  # Extract audio bytes from tuple
+                else:
+                    chunk_bytes = item  # Already plain bytes
+
                 data, sr = sf.read(io.BytesIO(chunk_bytes))
                 all_audio_data.append(data)
-            
+
             if not all_audio_data:
                 messagebox.showwarning("No Audio", "No audio data to save.")
                 return
-            
+
             combined_audio = np.concatenate(all_audio_data)
-            
+
             # Ask user where to save
             filename = filedialog.asksaveasfilename(
                 defaultextension=".wav",
                 filetypes=[("WAV files", "*.wav"), ("All files", "*.*")],
                 initialfile=f"neutts_speech_{datetime.now().strftime('%Y%m%d_%H%M%S')}.wav"
             )
-            
+
             if filename:
                 sf.write(filename, combined_audio, 24000)
                 self.status_label.config(text=f"Saved to: {os.path.basename(filename)}")
